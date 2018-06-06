@@ -3411,7 +3411,7 @@ static list *clusterManagerGetDisconnectedLinks(clusterManagerNode *node) {
                             (strstr(link_status, "disconnected")));
         int handshaking = (strstr(flags, "handshake") != NULL);
         if (disconnected || handshaking) {
-            clusterManagerLink *link = malloc(sizeof(*link)); 
+            clusterManagerLink *link = zmalloc(sizeof(*link)); 
             link->node_name = sdsnew(nodename);
             link->node_addr = sdsnew(addr);
             link->connected = 0;
@@ -3430,6 +3430,7 @@ cleanup:
 static dict *clusterManagerGetLinkStatus(void) {
     if (cluster_manager.nodes == NULL) return NULL;
     dictType dtype = clusterManagerDictType;
+    dtype.keyDestructor = dictSdsDestructor;
     dtype.valDestructor = dictListDestructor;
     dict *status = dictCreate(&dtype, NULL);
     listIter li;
