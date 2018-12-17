@@ -1993,7 +1993,8 @@ static int clusterManagerGetAntiAffinityScore(clusterManagerNodeArray *ipnodes,
     int ip_count, clusterManagerNode ***offending, int *offending_len);
 static void clusterManagerOptimizeAntiAffinity(clusterManagerNodeArray *ipnodes,
     int ip_count);
-static sds clusterManagerNodeInfo(clusterManagerNode *node, int indent);
+static sds clusterManagerNodeInfo(clusterManagerNode *node, int indent,
+    int abbr);
 static void clusterManagerShowNodes(void);
 static void clusterManagerShowClusterInfo(void);
 static int clusterManagerFlushNodeConfig(clusterManagerNode *node, char **err);
@@ -2669,7 +2670,9 @@ static unsigned int clusterManagerKeyHashSlot(char *key, int keylen) {
 }
 
 /* Return a string representation of the cluster node. */
-static sds clusterManagerNodeInfo(clusterManagerNode *node, int indent) {
+static sds clusterManagerNodeInfo(clusterManagerNode *node, int indent,
+    int abbr)
+{
     sds info = sdsempty();
     sds spaces = sdsempty();
     int i;
@@ -2677,16 +2680,27 @@ static sds clusterManagerNodeInfo(clusterManagerNode *node, int indent) {
     if (indent) info = sdscat(info, spaces);
     int is_master = !(node->flags & CLUSTER_MANAGER_FLAG_SLAVE);
     char *role = (is_master ? "M" : "S");
+    char *name = node->name;
+    char abbr_name[14];
+    if (abbr) {
+        abbr_name[0] = '(';
+        char *p = abbr_name + 1;
+        memcpy(p, node->name, 8);
+        p += 8;
+        memcpy(p, "...)", 4);
+        *(p + 4) = '\0';
+        name = abbr_name;
+    }
     sds slots = NULL;
     if (node->dirty && node->replicate != NULL)
-        info = sdscatfmt(info, "S: %S %s:%u", node->name, node->ip, node->port);
+        info = sdscatfmt(info, "S: %s:%u %s", node->ip, node->port, name);
     else {
         slots = clusterManagerNodeSlotsString(node);
         sds flags = clusterManagerNodeFlagString(node);
-        info = sdscatfmt(info, "%s: %S %s:%u\n"
+        info = sdscatfmt(info, "%s: %s:%u %s\n"
                                "%s   slots:%S (%u slots) "
                                "%S",
-                               role, node->name, node->ip, node->port, spaces,
+                               role, node->ip, node->port, name, spaces,
                                slots, node->slots_count, flags);
         sdsfree(slots);
         sdsfree(flags);
@@ -2706,7 +2720,7 @@ static void clusterManagerShowNodes(void) {
     listRewind(cluster_manager.nodes, &li);
     while ((ln = listNext(&li)) != NULL) {
         clusterManagerNode *node = ln->value;
-        sds info = clusterManagerNodeInfo(node, 0);
+        sds info = clusterManagerNodeInfo(node, 0, 1);
         printf("%s\n", (char *) info);
         sdsfree(info);
     }
@@ -4483,7 +4497,7 @@ static int clusterManagerCheckCluster(int quiet) {
             sds errstr = sdsempty();
             errstr = sdscatprintf(errstr,
                                 "[WARNING] Node %s:%d has slots in "
-                                "migrating state ",
+                                "migrating state: ",
                                 n->ip,
                                 n->port);
             for (i = 0; i < n->migrating_count; i += 2) {
@@ -4501,7 +4515,7 @@ static int clusterManagerCheckCluster(int quiet) {
             sds errstr = sdsempty();
             errstr = sdscatprintf(errstr,
                                 "[WARNING] Node %s:%d has slots in "
-                                "importing state ",
+                                "importing state: ",
                                 n->ip,
                                 n->port);
             for (i = 0; i < n->importing_count; i += 2) {
@@ -5402,12 +5416,12 @@ static int clusterManagerCommandReshard(int argc, char **argv) {
     listRewind(sources, &li);
     while ((ln = listNext(&li)) != NULL) {
         clusterManagerNode *src = ln->value;
-        sds info = clusterManagerNodeInfo(src, 4);
+        sds info = clusterManagerNodeInfo(src, 4, 0);
         printf("%s\n", info);
         sdsfree(info);
     }
     printf("  Destination node:\n");
-    sds info = clusterManagerNodeInfo(target, 4);
+    sds info = clusterManagerNodeInfo(target, 4, 0);
     printf("%s\n", info);
     sdsfree(info);
     table = clusterManagerComputeReshardTable(sources, slots);
