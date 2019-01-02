@@ -118,6 +118,7 @@
 #define CLUSTER_MANAGER_CMD_FLAG_COPY           1 << 7
 #define CLUSTER_MANAGER_CMD_FLAG_COLOR          1 << 8
 #define CLUSTER_MANAGER_CMD_FLAG_CHECK_OWNERS   1 << 9
+#define CLUSTER_MANAGER_CMD_FLAG_FULL_IDS       1 << 10
 
 #define CLUSTER_MANAGER_OPT_GETFRIENDS  1 << 0
 #define CLUSTER_MANAGER_OPT_COLD        1 << 1
@@ -1405,6 +1406,9 @@ static int parseOptions(int argc, char **argv) {
         } else if (!strcmp(argv[i],"--cluster-yes")) {
             config.cluster_manager_command.flags |=
                 CLUSTER_MANAGER_CMD_FLAG_YES;
+        } else if (!strcmp(argv[i],"--cluster-full-ids")) {
+            config.cluster_manager_command.flags |=
+                CLUSTER_MANAGER_CMD_FLAG_FULL_IDS;
         } else if (!strcmp(argv[i],"--cluster-simulate")) {
             config.cluster_manager_command.flags |=
                 CLUSTER_MANAGER_CMD_FLAG_SIMULATE;
@@ -2058,6 +2062,10 @@ clusterManagerCommandDef clusterManagerCommands[] = {
     {"import", clusterManagerCommandImport, 1, "host:port",
      "from <arg>,copy,replace"},
     {"help", clusterManagerCommandHelp, 0, NULL, NULL}
+};
+
+char *clusterManagerGenericOptions[] = {
+    "full-ids"
 };
 
 
@@ -2718,9 +2726,11 @@ static void clusterManagerShowNodes(void) {
     listIter li;
     listNode *ln;
     listRewind(cluster_manager.nodes, &li);
+    int flags = config.cluster_manager_command.flags;
+    int abbreviated = !(flags & CLUSTER_MANAGER_CMD_FLAG_FULL_IDS);
     while ((ln = listNext(&li)) != NULL) {
         clusterManagerNode *node = ln->value;
-        sds info = clusterManagerNodeInfo(node, 0, 1);
+        sds info = clusterManagerNodeInfo(node, 0, abbreviated);
         printf("%s\n", (char *) info);
         sdsfree(info);
     }
@@ -5897,7 +5907,7 @@ static int clusterManagerCommandHelp(int argc, char **argv) {
     int commands_count = sizeof(clusterManagerCommands) /
                          sizeof(clusterManagerCommandDef);
     int i = 0, j;
-    fprintf(stderr, "Cluster Manager Commands:\n");
+    fprintf(stderr, "\nCluster Manager Commands:\n");
     int padding = 15;
     for (; i < commands_count; i++) {
         clusterManagerCommandDef *def = &(clusterManagerCommands[i]);
@@ -5925,6 +5935,11 @@ static int clusterManagerCommandHelp(int argc, char **argv) {
             }
         }
     }
+    fprintf(stderr, "\nGeneric Options:\n");
+    int generic_options_count = sizeof(clusterManagerGenericOptions) /
+                                sizeof(char *);
+    for (i = 0; i < generic_options_count; i++)
+        fprintf(stderr, "  --cluster-%s\n", clusterManagerGenericOptions[i]);
     fprintf(stderr, "\nFor check, fix, reshard, del-node, set-timeout you "
                     "can specify the host and port of any working node in "
                     "the cluster.\n\n");
