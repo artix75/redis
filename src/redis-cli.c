@@ -4700,7 +4700,7 @@ static clusterManagerNode *clusterNodeForResharding(char *id,
     clusterManagerNode *node = NULL;
     const char *invalid_node_msg = "*** The specified node (%s) is not known "
                                    "or not a master, please retry.\n";
-    node = clusterManagerNodeByName(id);
+    node = clusterManagerNodeByAbbreviatedName(id);
     *raise_err = 0;
     if (!node || node->flags & CLUSTER_MANAGER_FLAG_SLAVE) {
         clusterManagerLogErr(invalid_node_msg, id);
@@ -5170,7 +5170,7 @@ static int clusterManagerCommandAddNode(int argc, char **argv) {
     if (config.cluster_manager_command.flags & CLUSTER_MANAGER_CMD_FLAG_SLAVE) {
         char *master_id = config.cluster_manager_command.master_id;
         if (master_id != NULL) {
-            master_node = clusterManagerNodeByName(master_id);
+            master_node = clusterManagerNodeByAbbreviatedName(master_id);
             if (master_node == NULL) {
                 clusterManagerLogErr("[ERR] No such master ID %s\n", master_id);
                 return 0;
@@ -5261,7 +5261,7 @@ static int clusterManagerCommandDeleteNode(int argc, char **argv) {
     if (!clusterManagerLoadInfoFromNode(ref_node, 0)) return 0;
 
     // Check if the node exists and is not empty
-    node = clusterManagerNodeByName(node_id);
+    node = clusterManagerNodeByAbbreviatedName(node_id);
     if (node == NULL) {
         clusterManagerLogErr("[ERR] No such node ID %s\n", node_id);
         return 0;
