@@ -1976,6 +1976,15 @@ static dictType clusterManagerDictType = {
     dictSdsDestructor          /* val destructor */
 };
 
+static dictType clusterManagerDictTypeLists = {
+    dictSdsHash,               /* hash function */
+    NULL,                      /* key dup */
+    NULL,                      /* val dup */
+    dictSdsKeyCompare,         /* key compare */
+    NULL,                      /* key destructor */
+    dictListDestructor         /* val destructor */
+};
+
 typedef int clusterManagerCommandProc(int argc, char **argv);
 typedef int (*clusterManagerOnReplyError)(redisReply *reply,
     clusterManagerNode *n, int bulk_idx);
@@ -1998,7 +2007,7 @@ static int clusterManagerGetAntiAffinityScore(clusterManagerNodeArray *ipnodes,
 static void clusterManagerOptimizeAntiAffinity(clusterManagerNodeArray *ipnodes,
     int ip_count);
 static sds clusterManagerNodeInfo(clusterManagerNode *node, int indent,
-    int abbr);
+    int abbreviated, dict *replicas);
 static void clusterManagerShowNodes(void);
 static void clusterManagerShowClusterInfo(void);
 static int clusterManagerFlushNodeConfig(clusterManagerNode *node, char **err);
@@ -2677,20 +2686,50 @@ static unsigned int clusterManagerKeyHashSlot(char *key, int keylen) {
     return crc16(key+s+1,e-s-1) & 0x3FFF;
 }
 
+/* Return a dict containing all masters' replicas. Masters' IDs are used
+ * as keys. Every value is a list containing all the replicas as
+ * *clusterManagerNode. If *masters is not NULL, it will be filled with
+ * all master nodesi (it can be useful in order to avoid cycling all
+ * cluster nodes again to find masters). */
+
+static dict *clusterManagerGetReplicas(list *masters) {
+    dict *replicas = dictCreate(&clusterManagerDictTypeLists, NULL);
+    listIter li;
+    listNode *ln;
+    listRewind(cluster_manager.nodes, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        clusterManagerNode *node = ln->value;
+        if (node->replicate != NULL) {
+            sds master_id = node->replicate;
+            if (master_id != NULL) {
+                dictEntry *entry = dictFind(replicas, master_id);
+                list *nodes = NULL;
+                if (entry == NULL) {
+                    nodes = listCreate();
+                    dictAdd(replicas, master_id, nodes);
+                } else nodes = dictGetVal(entry);
+                listAddNodeTail(nodes, node);
+            }
+        } else if (masters) listAddNodeTail(masters, node);
+    }
+    return replicas;
+}
+
 /* Return a string representation of the cluster node. */
 static sds clusterManagerNodeInfo(clusterManagerNode *node, int indent,
-    int abbr)
+    int abbreviated, dict *replicas)
 {
     sds info = sdsempty();
     sds spaces = sdsempty();
-    int i;
+    int i, replicas_count = node->replicas_count;
     for (i = 0; i < indent; i++) spaces = sdscat(spaces, " ");
     if (indent) info = sdscat(info, spaces);
-    int is_master = !(node->flags & CLUSTER_MANAGER_FLAG_SLAVE);
-    char *role = (is_master ? "M" : "S");
+    int is_replica = node->replicate ||
+                    (node->flags & CLUSTER_MANAGER_FLAG_SLAVE);
+    char *role = (is_replica ? "R" : "M");
     char *name = node->name;
     char abbr_name[14];
-    if (abbr) {
+    if (abbreviated) {
         abbr_name[0] = '(';
         char *p = abbr_name + 1;
         memcpy(p, node->name, 8);
@@ -2699,25 +2738,37 @@ static sds clusterManagerNodeInfo(clusterManagerNode *node, int indent,
         *(p + 4) = '\0';
         name = abbr_name;
     }
-    sds slots = NULL;
-    if (node->dirty && node->replicate != NULL)
-        info = sdscatfmt(info, "S: %s:%u %s", node->ip, node->port, name);
-    else {
-        slots = clusterManagerNodeSlotsString(node);
+    info = sdscatfmt(info, "%s: %s:%u %s", role, node->ip, node->port, name);
+    if (!node->dirty || node->replicate == NULL) {
+        if (node->slots_count > 0) {
+            sds slots = clusterManagerNodeSlotsString(node);
+            info = sdscatfmt(info, "\n%s   slots: %S (%u)", spaces, slots,
+                             node->slots_count);
+            sdsfree(slots);
+        }
         sds flags = clusterManagerNodeFlagString(node);
-        info = sdscatfmt(info, "%s: %s:%u %s\n"
-                               "%s   slots:%S (%u slots) "
-                               "%S",
-                               role, node->ip, node->port, name, spaces,
-                               slots, node->slots_count, flags);
-        sdsfree(slots);
+        if (sdslen(flags) > 0)
+            info = sdscatfmt(info, " | flags: %S", flags);
         sdsfree(flags);
     }
-    if (node->replicate != NULL)
-        info = sdscatfmt(info, "\n%s   replicates %S", spaces, node->replicate);
-    else if (node->replicas_count)
-        info = sdscatfmt(info, "\n%s   %U additional replica(s)",
-                         spaces, node->replicas_count);
+    if (!is_replica && replicas) {
+        dictEntry *entry = dictFind(replicas, node->name);
+        assert(entry != NULL);
+        list *replicating_nodes = (list *) dictGetVal(entry);
+        if (!replicas_count) replicas_count = listLength(replicating_nodes);
+        info = sdscatfmt(info, "\n%s   %U Replica(s)",
+                         spaces, replicas_count);
+        listIter li;
+        listNode *ln;
+        listRewind(replicating_nodes, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            clusterManagerNode *r = ln->value;
+            sds rinfo =
+                clusterManagerNodeInfo(r, 0, abbreviated, NULL);
+            info = sdscatfmt(info, "\n%s   - %S", spaces, rinfo);
+            sdsfree(rinfo);
+        }
+    }
     sdsfree(spaces);
     return info;
 }
@@ -2725,15 +2776,19 @@ static sds clusterManagerNodeInfo(clusterManagerNode *node, int indent,
 static void clusterManagerShowNodes(void) {
     listIter li;
     listNode *ln;
-    listRewind(cluster_manager.nodes, &li);
     int flags = config.cluster_manager_command.flags;
     int abbreviated = !(flags & CLUSTER_MANAGER_CMD_FLAG_FULL_IDS);
+    list *masters = listCreate();
+    dict *replicas = clusterManagerGetReplicas(masters);
+    listRewind(masters, &li);
     while ((ln = listNext(&li)) != NULL) {
-        clusterManagerNode *node = ln->value;
-        sds info = clusterManagerNodeInfo(node, 0, abbreviated);
+        clusterManagerNode *master = ln->value;
+        sds info = clusterManagerNodeInfo(master, 0, abbreviated, replicas);
         printf("%s\n", (char *) info);
         sdsfree(info);
     }
+    listRelease(masters);
+    dictRelease(replicas);
 }
 
 static void clusterManagerShowClusterInfo(void) {
@@ -5426,12 +5481,12 @@ static int clusterManagerCommandReshard(int argc, char **argv) {
     listRewind(sources, &li);
     while ((ln = listNext(&li)) != NULL) {
         clusterManagerNode *src = ln->value;
-        sds info = clusterManagerNodeInfo(src, 4, 0);
+        sds info = clusterManagerNodeInfo(src, 4, 0, NULL);
         printf("%s\n", info);
         sdsfree(info);
     }
     printf("  Destination node:\n");
-    sds info = clusterManagerNodeInfo(target, 4, 0);
+    sds info = clusterManagerNodeInfo(target, 4, 0, NULL);
     printf("%s\n", info);
     sdsfree(info);
     table = clusterManagerComputeReshardTable(sources, slots);
