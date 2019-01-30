@@ -2721,7 +2721,7 @@ static sds clusterManagerNodeInfo(clusterManagerNode *node, int indent,
 {
     sds info = sdsempty();
     sds spaces = sdsempty();
-    int i, replicas_count = node->replicas_count;
+    int i;
     for (i = 0; i < indent; i++) spaces = sdscat(spaces, " ");
     if (indent) info = sdscat(info, spaces);
     int is_replica = node->replicate ||
@@ -2740,24 +2740,22 @@ static sds clusterManagerNodeInfo(clusterManagerNode *node, int indent,
     }
     info = sdscatfmt(info, "%s: %s:%u %s", role, node->ip, node->port, name);
     if (!node->dirty || node->replicate == NULL) {
+        sds flags = clusterManagerNodeFlagString(node);
+        if (sdslen(flags) > 0)
+            info = sdscatfmt(info, " | %S", flags);
+        sdsfree(flags);
         if (node->slots_count > 0) {
             sds slots = clusterManagerNodeSlotsString(node);
             info = sdscatfmt(info, "\n%s   slots: %S (%u)", spaces, slots,
                              node->slots_count);
             sdsfree(slots);
         }
-        sds flags = clusterManagerNodeFlagString(node);
-        if (sdslen(flags) > 0)
-            info = sdscatfmt(info, " | flags: %S", flags);
-        sdsfree(flags);
     }
     if (!is_replica && replicas) {
         dictEntry *entry = dictFind(replicas, node->name);
         assert(entry != NULL);
+        i = 0;
         list *replicating_nodes = (list *) dictGetVal(entry);
-        if (!replicas_count) replicas_count = listLength(replicating_nodes);
-        info = sdscatfmt(info, "\n%s   %U Replica(s)",
-                         spaces, replicas_count);
         listIter li;
         listNode *ln;
         listRewind(replicating_nodes, &li);
@@ -2765,7 +2763,7 @@ static sds clusterManagerNodeInfo(clusterManagerNode *node, int indent,
             clusterManagerNode *r = ln->value;
             sds rinfo =
                 clusterManagerNodeInfo(r, 0, abbreviated, NULL);
-            info = sdscatfmt(info, "\n%s   - %S", spaces, rinfo);
+            info = sdscatfmt(info, "\n%s   %U. %S", spaces, ++i, rinfo);
             sdsfree(rinfo);
         }
     }
