@@ -1,0 +1,38 @@
+/* Redis Cluster Manager */
+
+body {
+    font-family: sans-serif;
+    box-sizing: border-box;
+    font-size: 0.95em;
+}
+
+header h1 {
+    text-transform: uppercase;
+}
+
+#nodes, ul.node-replicas {
+    list-style-type: none;
+    margin: 0;
+    padding: 0;
+    max-width: 500px; 
+}
+
+ul.node-replicas {
+    padding-left: 1em;
+    margin-top: 0.5em;
+}
+
+li.node {
+    padding: 0.5em;
+}
+
+li.node .node-id {
+    font-size: .9em;
+    color: #888;
+}
+
+li.node.master {
+    border: 1px solid #ccc;
+    border-radius: 0.5em;
+    margin-bottom: 1em;
+}

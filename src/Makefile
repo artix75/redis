@@ -31,6 +31,8 @@ OPT=$(OPTIMIZATION)
 
 PREFIX?=/usr/local
 INSTALL_BIN=$(PREFIX)/bin
+INSTALL_SHARED=$(INSTALL_BIN)/shared/redis
+INSTALL_CLUSTER_MANAGER_HTTP=$(INSTALL_SHARED)/cluster-manager-http
 INSTALL=install
 
 # Default allocator defaults to Jemalloc if it's not an ARM
@@ -310,3 +312,5 @@ install: all
 	$(REDIS_INSTALL) $(REDIS_CHECK_RDB_NAME) $(INSTALL_BIN)
 	$(REDIS_INSTALL) $(REDIS_CHECK_AOF_NAME) $(INSTALL_BIN)
 	@ln -sf $(REDIS_SERVER_NAME) $(INSTALL_BIN)/$(REDIS_SENTINEL_NAME)
+	@mkdir -p $(INSTALL_CLUSTER_MANAGER_HTTP)
+	$(REDIS_INSTALL) cluster-manager-http/* $(INSTALL_CLUSTER_MANAGER_HTTP)/

@@ -100,6 +100,7 @@ typedef struct _redisHttpServer {
     aeEventLoop *el;
     int conn_fd;
     int verbosity;
+    void *data;
  } redisHttpServer;
 
 typedef struct _redisHttpClient {

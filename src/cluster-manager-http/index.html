@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+    <head>
+        <title>Redis Cluster Manager</title>
+        <link rel="stylesheet" type="text/css" href="/style.css">
+        <script src="/main.js"></script>
+    </head>
+    <body>
+        <header>
+            <h1>Redis Cluster Manager</h1>
+        </header>
+        <main>
+            <ul id="nodes"></ul>
+            <template id="node-template">
+                <li class="node">
+                    <div class="node-header">
+                        <span class="node-addr"></span>
+                        <span class="node-id"></span>
+                        <span class="node-flags"></span>
+                    </div>
+                    <div class="node-info"></div>
+                    <ul class="node-replicas"></ul>
+                </li>
+            </template>
+        </main>
+        <footer>
+        </footer>
+    </body>
+</html>

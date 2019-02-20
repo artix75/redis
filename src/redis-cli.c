@@ -55,6 +55,7 @@
 #include "help.h"
 #include "anet.h"
 #include "ae.h"
+#include "http.h"
 
 #define UNUSED(V) ((void) V)
 
@@ -176,6 +177,9 @@ typedef struct clusterManagerCommand {
     int timeout;
     int pipeline;
     float threshold;
+    int http_port;
+    char *http_path;
+    int http_verbosity;
 } clusterManagerCommand;
 
 static void createClusterManagerCommand(char *cmdname, int argc, char **argv);
@@ -1427,6 +1431,13 @@ static int parseOptions(int argc, char **argv) {
         } else if (!strcmp(argv[i],"--cluster-search-multiple-owners")) {
             config.cluster_manager_command.flags |=
                 CLUSTER_MANAGER_CMD_FLAG_CHECK_OWNERS;
+        } else if (!strcmp(argv[i],"--cluster-http-port") && !lastarg) {
+            config.cluster_manager_command.http_port = atof(argv[++i]);
+        } else if (!strcmp(argv[i],"--cluster-http-path") && !lastarg) {
+            config.cluster_manager_command.http_path = argv[++i];
+        } else if (!strcmp(argv[i],"--cluster-http-verbose")) {
+            config.cluster_manager_command.http_verbosity =
+                REDIS_HTTP_VERBOSITY_DEBUG;
         } else if (!strcmp(argv[i],"-v") || !strcmp(argv[i], "--version")) {
             sds version = cliVersion();
             printf("redis-cli %s\n", version);
@@ -2037,6 +2048,7 @@ static int clusterManagerCommandRebalance(int argc, char **argv);
 static int clusterManagerCommandSetTimeout(int argc, char **argv);
 static int clusterManagerCommandImport(int argc, char **argv);
 static int clusterManagerCommandCall(int argc, char **argv);
+static int clusterManagerCommandHttp(int argc, char **argv);
 static int clusterManagerCommandHelp(int argc, char **argv);
 
 typedef struct clusterManagerCommandDef {
@@ -2070,6 +2082,8 @@ clusterManagerCommandDef clusterManagerCommands[] = {
      "host:port milliseconds", NULL},
     {"import", clusterManagerCommandImport, 1, "host:port",
      "from <arg>,copy,replace"},
+    {"http", clusterManagerCommandHttp, -1, "host:port",
+     "http-port <port>,http-path <static_files_path>,http-verbose"},
     {"help", clusterManagerCommandHelp, 0, NULL, NULL}
 };
 
@@ -5954,6 +5968,61 @@ invalid_args:
     return 0;
 }
 
+static int clusterManagerHttpGetNodes(redisHttpClient *c,
+                                      redisHttpRequest *req,
+                                      redisHttpResponse *res)
+{
+    UNUSED(c);
+    UNUSED(req);
+    redisHttpSetContentType(res, "text/json");
+    res->body = sdscat(res->body, "[");
+    listIter li;
+    listNode *ln;
+    listRewind(cluster_manager.nodes, &li);
+    int is_first = 1;
+    while ((ln = listNext(&li)) != NULL) {
+        if (!is_first) res->body = sdscat(res->body, ",");
+        clusterManagerNode *n = ln->value;
+        res->body = sdscatfmt(res->body, "{\"id\": \"%S\",", n->name);
+        res->body = sdscatfmt(res->body, "\"ip\": \"%s\",", n->ip);
+        res->body = sdscatfmt(res->body, "\"port\": %U,", n->port);
+        sds flags = clusterManagerNodeFlagString(n);
+        res->body = sdscatfmt(res->body, "\"flags\": \"%S\"", flags);
+        if (n->replicate) {
+            res->body =
+                sdscatfmt(res->body, ",\"master_id\": \"%S\"", n->replicate);
+        }
+        res->body = sdscat(res->body, "}");
+        is_first = 0;
+        sdsfree(flags);
+    }
+    res->body = sdscat(res->body, "]");
+    return 1;
+}
+
+static int clusterManagerCommandHttp(int argc, char **argv) {
+    int port = 0, success = 1;
+    char *ip = NULL;
+    if (!getClusterHostFromCmdArgs(argc, argv, &ip, &port)) goto invalid_args;
+    clusterManagerNode *refnode = clusterManagerNewNode(ip, port);
+    if (!clusterManagerLoadInfoFromNode(refnode, 0)) return 0;
+    int http_port = config.cluster_manager_command.http_port;
+    char *http_path = config.cluster_manager_command.http_path;
+    redisHttpServer *http_server = redisHttpServerCreate(http_port);
+    http_server->static_path = http_path;
+    http_server->verbosity =
+        config.cluster_manager_command.http_verbosity;
+    redisHttpGet(http_server, "/nodes", clusterManagerHttpGetNodes);
+    success = redisHttpServerStart(http_server);
+    if (http_server != NULL) {
+        redisHttpServerRelease(http_server);
+    }
+    return success;
+invalid_args:
+    fprintf(stderr, CLUSTER_MANAGER_INVALID_HOST_ARG);
+    return 0;
+}
+
 static int clusterManagerCommandHelp(int argc, char **argv) {
     UNUSED(argc);
     UNUSED(argv);
@@ -7308,6 +7377,11 @@ int main(int argc, char **argv) {
     config.cluster_manager_command.pipeline = CLUSTER_MANAGER_MIGRATE_PIPELINE;
     config.cluster_manager_command.threshold =
         CLUSTER_MANAGER_REBALANCE_THRESHOLD;
+    config.cluster_manager_command.http_port = 0;
+    config.cluster_manager_command.http_verbosity =
+        REDIS_HTTP_VERBOSITY_INFO;
+    config.cluster_manager_command.http_path =
+        "/usr/local/shared/redis/cluster-manager-http";
     pref.hints = 1;
 
     spectrum_palette = spectrum_palette_color;

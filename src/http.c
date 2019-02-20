@@ -63,6 +63,7 @@ static mimetype mime_types[] = {
     {".gif", "image/gif"},
     {".htm", "text/html"},
     {".html", "text/html"},
+    {".json", "text/json"},
     {".jpeg", "image/jpeg"},
     {".jpg", "image/jpeg"},
     {".ico", "image/x-icon"},
@@ -407,7 +408,7 @@ static void readStaticFile(redisHttpClient *c, redisHttpResponse *r,
     redisHttpSetContentType(r, content_type);
     if (sdslen(r->body) > 0) sdsclear(r->body);
     r->body = sdsMakeRoomFor(r->body, file->size);
-    int nread, totread = 0, readlen = 1024;
+    int nread, totread = 0, readlen = file->size;
     while ((nread = read(file->fd, r->body + sdslen(r->body), readlen)) > 0) {
         totread += nread;
     }
@@ -493,6 +494,7 @@ static void processRequest(redisHttpClient *c) {
             fpath = sdscat(fpath, req->path + 1);
         else
             fpath = sdscat(fpath, req->path);
+        if (strcmp(req->path, "/") == 0) fpath = sdscat(fpath, "index.html");
         redisHttpLogDebug(c, "Trying static path: %s\n", fpath);
         int ffd = open(fpath, O_RDONLY, 0);
         if (ffd > 0) {
@@ -502,7 +504,7 @@ static void processRequest(redisHttpClient *c) {
             /* TODO: implement symlinks */
             if (S_ISREG(sbuf.st_mode)) {
                 found = 1;
-                static_file.filename = strrchr(req->path, '/');
+                static_file.filename = strrchr(fpath, '/');
                 if (static_file.filename == NULL)
                     static_file.filename = req->path;
                 static_file.fd = ffd;
