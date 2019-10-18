@@ -561,9 +561,9 @@ void moduleHandlePropagationAfterCommandCallback(RedisModuleCtx *ctx) {
                 propagate(rop->cmd,rop->dbid,rop->argv,rop->argc,target);
         }
         redisOpArrayFree(&server.also_propagate);
+        /* Restore the previous oparray in case of nexted use of the API. */
+        server.also_propagate = ctx->saved_oparray;
     }
-    /* Restore the previous oparray in case of nexted use of the API. */
-    server.also_propagate = ctx->saved_oparray;
 }
 
 /* Free the context after the user function was called. */
@@ -1504,7 +1504,15 @@ int RM_ReplicateVerbatim(RedisModuleCtx *ctx) {
  *    are guaranteed to get IDs greater than any past ID previously seen.
  *
  * Valid IDs are from 1 to 2^64-1. If 0 is returned it means there is no way
- * to fetch the ID in the context the function was currently called. */
+ * to fetch the ID in the context the function was currently called.
+ *
+ * After obtaining the ID, it is possible to check if the command execution
+ * is actually happening in the context of AOF loading, using this macro:
+ *
+ *      if (RedisModule_IsAOFClient(RedisModule_GetClientId(ctx)) {
+ *          // Handle it differently.
+ *      }
+ */
 unsigned long long RM_GetClientId(RedisModuleCtx *ctx) {
     if (ctx->client == NULL) return 0;
     return ctx->client->id;
@@ -1551,6 +1559,21 @@ int RM_GetSelectedDb(RedisModuleCtx *ctx) {
  *
  *  * REDISMODULE_CTX_FLAGS_OOM_WARNING: Less than 25% of memory remains before
  *                                       reaching the maxmemory level.
+ *
+ *  * REDISMODULE_CTX_FLAGS_REPLICA_IS_STALE: No active link with the master.
+ *
+ *  * REDISMODULE_CTX_FLAGS_REPLICA_IS_CONNECTING: The replica is trying to
+ *                                                 connect with the master.
+ *
+ *  * REDISMODULE_CTX_FLAGS_REPLICA_IS_TRANSFERRING: Master -> Replica RDB
+ *                                                   transfer is in progress.
+ *
+ *  * REDISMODULE_CTX_FLAGS_REPLICA_IS_ONLINE: The replica has an active link
+ *                                             with its master. This is the
+ *                                             contrary of STALE state.
+ *
+ *  * REDISMODULE_CTX_FLAGS_ACTIVE_CHILD: There is currently some background
+ *                                        process active (RDB, AUX or module).
  */
 int RM_GetContextFlags(RedisModuleCtx *ctx) {
 
@@ -1593,6 +1616,20 @@ int RM_GetContextFlags(RedisModuleCtx *ctx) {
         flags |= REDISMODULE_CTX_FLAGS_SLAVE;
         if (server.repl_slave_ro)
             flags |= REDISMODULE_CTX_FLAGS_READONLY;
+
+        /* Replica state flags. */
+        if (server.repl_state == REPL_STATE_CONNECT ||
+            server.repl_state == REPL_STATE_CONNECTING)
+        {
+            flags |= REDISMODULE_CTX_FLAGS_REPLICA_IS_CONNECTING;
+        } else if (server.repl_state == REPL_STATE_TRANSFER) {
+            flags |= REDISMODULE_CTX_FLAGS_REPLICA_IS_TRANSFERRING;
+        } else if (server.repl_state == REPL_STATE_CONNECTED) {
+            flags |= REDISMODULE_CTX_FLAGS_REPLICA_IS_ONLINE;
+        }
+
+        if (server.repl_state != REPL_STATE_CONNECTED)
+            flags |= REDISMODULE_CTX_FLAGS_REPLICA_IS_STALE;
     }
 
     /* OOM flag. */
@@ -1600,6 +1637,9 @@ int RM_GetContextFlags(RedisModuleCtx *ctx) {
     int retval = getMaxmemoryState(NULL,NULL,NULL,&level);
     if (retval == C_ERR) flags |= REDISMODULE_CTX_FLAGS_OOM;
     if (level > 0.75) flags |= REDISMODULE_CTX_FLAGS_OOM_WARNING;
+
+    /* Presence of children processes. */
+    if (hasActiveChildProcess()) flags |= REDISMODULE_CTX_FLAGS_ACTIVE_CHILD;
 
     return flags;
 }
@@ -2872,7 +2912,7 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
 
     /* Create the client and dispatch the command. */
     va_start(ap, fmt);
-    c = createClient(-1);
+    c = createClient(NULL);
     c->user = NULL; /* Root user. */
     argv = moduleCreateArgvFromUserFormat(cmdname,fmt,&argc,&flags,ap);
     replicate = flags & REDISMODULE_ARGV_REPLICATE;
@@ -3836,7 +3876,7 @@ RedisModuleBlockedClient *RM_BlockClient(RedisModuleCtx *ctx, RedisModuleCmdFunc
     bc->disconnect_callback = NULL; /* Set by RM_SetDisconnectCallback() */
     bc->free_privdata = free_privdata;
     bc->privdata = NULL;
-    bc->reply_client = createClient(-1);
+    bc->reply_client = createClient(NULL);
     bc->reply_client->flags |= CLIENT_MODULE;
     bc->dbid = c->db->id;
     c->bpop.timeout = timeout_ms ? (mstime()+timeout_ms) : 0;
@@ -4077,7 +4117,7 @@ RedisModuleCtx *RM_GetThreadSafeContext(RedisModuleBlockedClient *bc) {
      * access it safely from another thread, so we create a fake client here
      * in order to keep things like the currently selected database and similar
      * things. */
-    ctx->client = createClient(-1);
+    ctx->client = createClient(NULL);
     if (bc) {
         selectDb(ctx->client,bc->dbid);
         ctx->client->id = bc->client->id;
@@ -5552,7 +5592,7 @@ void moduleInitModulesSystem(void) {
 
     /* Set up the keyspace notification susbscriber list and static client */
     moduleKeyspaceSubscribers = listCreate();
-    moduleFreeContextReusedClient = createClient(-1);
+    moduleFreeContextReusedClient = createClient(NULL);
     moduleFreeContextReusedClient->flags |= CLIENT_MODULE;
     moduleFreeContextReusedClient->user = NULL; /* root user. */
 
@@ -5697,6 +5737,23 @@ int moduleUnload(sds name) {
     } else if (listLength(module->usedby)) {
         errno = EPERM;
         return REDISMODULE_ERR;
+    }
+    
+    /* Give module a chance to clean up. */
+    int (*onunload)(void *);
+    onunload = (int (*)(void *))(unsigned long) dlsym(module->handle, "RedisModule_OnUnload");
+    if (onunload) {
+        RedisModuleCtx ctx = REDISMODULE_CTX_INIT;
+        ctx.module = module;
+        ctx.client = moduleFreeContextReusedClient;
+        int unload_status = onunload((void*)&ctx);
+        moduleFreeContext(&ctx);
+
+        if (unload_status == REDISMODULE_ERR) {
+            serverLog(LL_WARNING, "Module %s OnUnload failed.  Unload canceled.", name);
+            errno = ECANCELED;
+            return REDISMODULE_ERR;
+        }
     }
 
     moduleUnregisterCommands(module);

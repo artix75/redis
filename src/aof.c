@@ -385,6 +385,10 @@ void flushAppendOnlyFile(int force) {
      * there is much to do about the whole server stopping for power problems
      * or alike */
 
+    if (server.aof_flush_sleep && sdslen(server.aof_buf)) {
+        usleep(server.aof_flush_sleep);
+    }
+
     latencyStartMonitor(latency);
     nwritten = aofWrite(server.aof_fd,server.aof_buf,sdslen(server.aof_buf));
     latencyEndMonitor(latency);
@@ -648,11 +652,12 @@ void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int a
 
 /* In Redis commands are always executed in the context of a client, so in
  * order to load the append only file we need to create a fake client. */
-struct client *createFakeClient(void) {
+struct client *createAOFClient(void) {
     struct client *c = zmalloc(sizeof(*c));
 
     selectDb(c,0);
-    c->fd = -1;
+    c->id = CLIENT_ID_AOF; /* So modules can identify it's the AOF client. */
+    c->conn = NULL;
     c->name = NULL;
     c->querybuf = sdsempty();
     c->querybuf_peak = 0;
@@ -725,7 +730,7 @@ int loadAppendOnlyFile(char *filename) {
      * to the same file we're about to read. */
     server.aof_state = AOF_OFF;
 
-    fakeClient = createFakeClient();
+    fakeClient = createAOFClient();
     startLoadingFile(fp, filename);
 
     /* Check if this AOF file has an RDB preamble. In that case we need to
@@ -835,6 +840,8 @@ int loadAppendOnlyFile(char *filename) {
         freeFakeClientArgv(fakeClient);
         fakeClient->cmd = NULL;
         if (server.aof_load_truncated) valid_up_to = ftello(fp);
+        if (server.key_load_delay)
+            usleep(server.key_load_delay);
     }
 
     /* This point can only be reached when EOF is reached without errors.
