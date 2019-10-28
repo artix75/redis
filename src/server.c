@@ -146,7 +146,7 @@ volatile unsigned long lru_clock; /* Server global current LRU time. */
  *              in this condition but just a few.
  *
  * no-monitor:  Do not automatically propagate the command on MONITOR.
- * 
+ *
  * no-slowlog:  Do not automatically propagate the command to the slowlog.
  *
  * cluster-asking: Perform an implicit ASKING for this command, so the
@@ -2104,7 +2104,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Check if there are clients unblocked by modules that implement
      * blocking commands. */
-    moduleHandleBlockedClients();
+    if (moduleCount()) moduleHandleBlockedClients();
 
     /* Try to process pending commands for clients that were just unblocked. */
     if (listLength(server.unblocked_clients))
@@ -3208,7 +3208,7 @@ void preventCommandReplication(client *c) {
  * CMD_CALL_STATS       Populate command stats.
  * CMD_CALL_PROPAGATE_AOF   Append command to AOF if it modified the dataset
  *                          or if the client flags are forcing propagation.
- * CMD_CALL_PROPAGATE_REPL  Send command to salves if it modified the dataset
+ * CMD_CALL_PROPAGATE_REPL  Send command to slaves if it modified the dataset
  *                          or if the client flags are forcing propagation.
  * CMD_CALL_PROPAGATE   Alias for PROPAGATE_AOF|PROPAGATE_REPL.
  * CMD_CALL_FULL        Alias for SLOWLOG|STATS|PROPAGATE.

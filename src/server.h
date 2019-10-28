@@ -68,6 +68,9 @@ typedef long long mstime_t; /* millisecond time type. */
 #include "rax.h"     /* Radix tree */
 #include "connection.h" /* Connection abstraction */
 
+#define REDISMODULE_CORE 1
+#include "redismodule.h"    /* Redis modules API defines. */
+
 /* Following includes allow test functions to be called from Redis main() */
 #include "zipmap.h"
 #include "sha1.h"
@@ -1598,6 +1601,7 @@ int TerminateModuleForkChild(int child_pid, int wait);
 ssize_t rdbSaveModulesAux(rio *rdb, int when);
 int moduleAllDatatypesHandleErrors();
 sds modulesCollectInfo(sds info, sds section, int for_crash_report, int sections);
+void moduleFireServerEvent(uint64_t eid, int subid, void *data);
 
 /* Utils */
 long long ustime(void);

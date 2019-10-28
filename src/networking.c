@@ -827,8 +827,10 @@ void clientAcceptHandler(connection *conn) {
     }
 
     server.stat_numconnections++;
+    moduleFireServerEvent(REDISMODULE_EVENT_CLIENT_CHANGE,
+                          REDISMODULE_SUBEVENT_CLIENT_CHANGE_CONNECTED,
+                          c);
 }
-
 
 #define MAX_ACCEPTS_PER_CALL 1000
 static void acceptCommonHandler(connection *conn, int flags, char *ip) {
@@ -1040,6 +1042,13 @@ void freeClient(client *c) {
     if (c->flags & CLIENT_PROTECTED) {
         freeClientAsync(c);
         return;
+    }
+
+    /* For connected clients, call the disconnection event of modules hooks. */
+    if (c->conn) {
+        moduleFireServerEvent(REDISMODULE_EVENT_CLIENT_CHANGE,
+                              REDISMODULE_SUBEVENT_CLIENT_CHANGE_DISCONNECTED,
+                              c);
     }
 
     /* If it is our master that's beging disconnected we should make sure

@@ -106,6 +106,11 @@
 /* There is currently some background process active. */
 #define REDISMODULE_CTX_FLAGS_ACTIVE_CHILD (1<<18)
 
+/* Keyspace changes notification classes. Every class is associated with a
+ * character for configuration purposes.
+ * NOTE: These have to be in sync with NOTIFY_* in server.h */
+#define REDISMODULE_NOTIFY_KEYSPACE (1<<0)    /* K */
+#define REDISMODULE_NOTIFY_KEYEVENT (1<<1)    /* E */
 #define REDISMODULE_NOTIFY_GENERIC (1<<2)     /* g */
 #define REDISMODULE_NOTIFY_STRING (1<<3)      /* $ */
 #define REDISMODULE_NOTIFY_LIST (1<<4)        /* l */
@@ -161,6 +166,132 @@ typedef uint64_t RedisModuleTimerID;
 
 /* Declare that the module can handle errors with RedisModule_SetModuleOptions. */
 #define REDISMODULE_OPTIONS_HANDLE_IO_ERRORS    (1<<0)
+
+/* Server events definitions. */
+#define REDISMODULE_EVENT_REPLICATION_ROLE_CHANGED 0
+#define REDISMODULE_EVENT_PERSISTENCE 1
+#define REDISMODULE_EVENT_FLUSHDB 2
+#define REDISMODULE_EVENT_LOADING 3
+#define REDISMODULE_EVENT_CLIENT_CHANGE 4
+#define REDISMODULE_EVENT_SHUTDOWN 5
+#define REDISMODULE_EVENT_REPLICA_CHANGE 6
+#define REDISMODULE_EVENT_MASTER_LINK_CHANGE 7
+#define REDISMODULE_EVENT_CRON_LOOP 8
+
+typedef struct RedisModuleEvent {
+    uint64_t id;        /* REDISMODULE_EVENT_... defines. */
+    uint64_t dataver;   /* Version of the structure we pass as 'data'. */
+} RedisModuleEvent;
+
+struct RedisModuleCtx;
+typedef void (*RedisModuleEventCallback)(struct RedisModuleCtx *ctx, RedisModuleEvent eid, uint64_t subevent, void *data);
+
+static RedisModuleEvent
+    RedisModuleEvent_ReplicationRoleChanged = {
+        REDISMODULE_EVENT_REPLICATION_ROLE_CHANGED,
+        1
+    },
+    RedisModuleEvent_Persistence = {
+        REDISMODULE_EVENT_PERSISTENCE,
+        1
+    },
+    RedisModuleEvent_FlushDB = {
+        REDISMODULE_EVENT_FLUSHDB,
+        1
+    },
+    RedisModuleEvent_Loading = {
+        REDISMODULE_EVENT_LOADING,
+        1
+    },
+    RedisModuleEvent_ClientChange = {
+        REDISMODULE_EVENT_CLIENT_CHANGE,
+        1
+    },
+    RedisModuleEvent_Shutdown = {
+        REDISMODULE_EVENT_SHUTDOWN,
+        1
+    },
+    RedisModuleEvent_ReplicaChange = {
+        REDISMODULE_EVENT_REPLICA_CHANGE,
+        1
+    },
+    RedisModuleEvent_CronLoop = {
+        REDISMODULE_EVENT_CRON_LOOP,
+        1
+    },
+    RedisModuleEvent_MasterLinkChange = {
+        REDISMODULE_EVENT_MASTER_LINK_CHANGE,
+        1
+    };
+
+/* Those are values that are used for the 'subevent' callback argument. */
+#define REDISMODULE_SUBEVENT_PERSISTENCE_RDB_START 0
+#define REDISMODULE_SUBEVENT_PERSISTENCE_RDB_END 1
+#define REDISMODULE_SUBEVENT_PERSISTENCE_AOF_START 2
+#define REDISMODULE_SUBEVENT_PERSISTENCE_AOF_END 3
+
+#define REDISMODULE_SUBEVENT_LOADING_RDB_START 0
+#define REDISMODULE_SUBEVENT_LOADING_RDB_END 1
+#define REDISMODULE_SUBEVENT_LOADING_AOF_START 2
+#define REDISMODULE_SUBEVENT_LOADING_AOF_END 3
+
+#define REDISMODULE_SUBEVENT_CLIENT_CHANGE_CONNECTED 0
+#define REDISMODULE_SUBEVENT_CLIENT_CHANGE_DISCONNECTED 1
+
+#define REDISMODULE_SUBEVENT_MASTER_LINK_UP 0
+#define REDISMODULE_SUBEVENT_MASTER_LINK_DOWN 1
+
+#define REDISMODULE_SUBEVENT_REPLICA_CHANGE_CONNECTED 0
+#define REDISMODULE_SUBEVENT_REPLICA_CHANGE_DISCONNECTED 1
+
+#define REDISMODULE_SUBEVENT_FLUSHDB_START 0
+#define REDISMODULE_SUBEVENT_FLUSHDB_END 1
+
+/* RedisModuleClientInfo flags. */
+#define REDISMODULE_CLIENTINFO_FLAG_SSL (1<<0)
+#define REDISMODULE_CLIENTINFO_FLAG_PUBSUB (1<<1)
+#define REDISMODULE_CLIENTINFO_FLAG_BLOCKED (1<<2)
+#define REDISMODULE_CLIENTINFO_FLAG_TRACKING (1<<3)
+#define REDISMODULE_CLIENTINFO_FLAG_UNIXSOCKET (1<<4)
+#define REDISMODULE_CLIENTINFO_FLAG_MULTI (1<<5)
+
+/* Here we take all the structures that the module pass to the core
+ * and the other way around. Notably the list here contains the structures
+ * used by the hooks API RedisModule_RegisterToServerEvent().
+ *
+ * The structures always start with a 'version' field. This is useful
+ * when we want to pass a reference to the structure to the core APIs,
+ * for the APIs to fill the structure. In that case, the structure 'version'
+ * field is initialized before passing it to the core, so that the core is
+ * able to cast the pointer to the appropriate structure version. In this
+ * way we obtain ABI compatibility.
+ *
+ * Here we'll list all the structure versions in case they evolve over time,
+ * however using a define, we'll make sure to use the last version as the
+ * public name for the module to use. */
+
+#define REDISMODULE_CLIENTINFO_VERSION 1
+typedef struct RedisModuleClientInfo {
+    uint64_t version;       /* Version of this structure for ABI compat. */
+    uint64_t flags;         /* REDISMODULE_CLIENTINFO_FLAG_* */
+    uint64_t id;            /* Client ID. */
+    char addr[46];          /* IPv4 or IPv6 address. */
+    uint16_t port;          /* TCP port. */
+    uint16_t db;            /* Selected DB. */
+} RedisModuleClientInfoV1;
+
+#define RedisModuleClientInfo RedisModuleClientInfoV1
+
+#define REDISMODULE_FLUSHINFO_VERSION 1
+typedef struct RedisModuleFlushInfo {
+    uint64_t version;       /* Not used since this structure is never passed
+                               from the module to the core right now. Here
+                               for future compatibility. */
+    int32_t sync;           /* Synchronous or threaded flush?. */
+    int32_t dbnum;          /* Flushed database number, -1 for ALL. */
+} RedisModuleFlushInfoV1;
+
+#define RedisModuleFlushInfo RedisModuleFlushInfoV1
 
 /* ------------------------- End of common defines ------------------------ */
 
@@ -256,10 +387,14 @@ const char *REDISMODULE_API_FUNC(RedisModule_StringPtrLen)(const RedisModuleStri
 int REDISMODULE_API_FUNC(RedisModule_ReplyWithError)(RedisModuleCtx *ctx, const char *err);
 int REDISMODULE_API_FUNC(RedisModule_ReplyWithSimpleString)(RedisModuleCtx *ctx, const char *msg);
 int REDISMODULE_API_FUNC(RedisModule_ReplyWithArray)(RedisModuleCtx *ctx, long len);
+int REDISMODULE_API_FUNC(RedisModule_ReplyWithNullArray)(RedisModuleCtx *ctx);
+int REDISMODULE_API_FUNC(RedisModule_ReplyWithEmptyArray)(RedisModuleCtx *ctx);
 void REDISMODULE_API_FUNC(RedisModule_ReplySetArrayLength)(RedisModuleCtx *ctx, long len);
 int REDISMODULE_API_FUNC(RedisModule_ReplyWithStringBuffer)(RedisModuleCtx *ctx, const char *buf, size_t len);
 int REDISMODULE_API_FUNC(RedisModule_ReplyWithCString)(RedisModuleCtx *ctx, const char *buf);
 int REDISMODULE_API_FUNC(RedisModule_ReplyWithString)(RedisModuleCtx *ctx, RedisModuleString *str);
+int REDISMODULE_API_FUNC(RedisModule_ReplyWithEmptyString)(RedisModuleCtx *ctx);
+int REDISMODULE_API_FUNC(RedisModule_ReplyWithVerbatimString)(RedisModuleCtx *ctx, const char *buf, size_t len);
 int REDISMODULE_API_FUNC(RedisModule_ReplyWithNull)(RedisModuleCtx *ctx);
 int REDISMODULE_API_FUNC(RedisModule_ReplyWithDouble)(RedisModuleCtx *ctx, double d);
 int REDISMODULE_API_FUNC(RedisModule_ReplyWithCallReply)(RedisModuleCtx *ctx, RedisModuleCallReply *reply);
@@ -295,6 +430,7 @@ int REDISMODULE_API_FUNC(RedisModule_HashGet)(RedisModuleKey *key, int flags, ..
 int REDISMODULE_API_FUNC(RedisModule_IsKeysPositionRequest)(RedisModuleCtx *ctx);
 void REDISMODULE_API_FUNC(RedisModule_KeyAtPos)(RedisModuleCtx *ctx, int pos);
 unsigned long long REDISMODULE_API_FUNC(RedisModule_GetClientId)(RedisModuleCtx *ctx);
+int REDISMODULE_API_FUNC(RedisModule_GetClientInfoById)(void *ci, uint64_t id);
 int REDISMODULE_API_FUNC(RedisModule_GetContextFlags)(RedisModuleCtx *ctx);
 void *REDISMODULE_API_FUNC(RedisModule_PoolAlloc)(RedisModuleCtx *ctx, size_t bytes);
 RedisModuleType *REDISMODULE_API_FUNC(RedisModule_CreateDataType)(RedisModuleCtx *ctx, const char *name, int encver, RedisModuleTypeMethods *typemethods);
@@ -319,6 +455,7 @@ float REDISMODULE_API_FUNC(RedisModule_LoadFloat)(RedisModuleIO *io);
 void REDISMODULE_API_FUNC(RedisModule_Log)(RedisModuleCtx *ctx, const char *level, const char *fmt, ...);
 void REDISMODULE_API_FUNC(RedisModule_LogIOError)(RedisModuleIO *io, const char *levelstr, const char *fmt, ...);
 void REDISMODULE_API_FUNC(RedisModule__Assert)(const char *estr, const char *file, int line);
+void REDISMODULE_API_FUNC(RedisModule_LatencyAddSample)(const char *event, mstime_t latency);
 int REDISMODULE_API_FUNC(RedisModule_StringAppendBuffer)(RedisModuleCtx *ctx, RedisModuleString *str, const char *buf, size_t len);
 void REDISMODULE_API_FUNC(RedisModule_RetainString)(RedisModuleCtx *ctx, RedisModuleString *str);
 int REDISMODULE_API_FUNC(RedisModule_StringCompare)(RedisModuleString *a, RedisModuleString *b);
@@ -359,6 +496,7 @@ int REDISMODULE_API_FUNC(RedisModule_InfoAddFieldCString)(RedisModuleInfoCtx *ct
 int REDISMODULE_API_FUNC(RedisModule_InfoAddFieldDouble)(RedisModuleInfoCtx *ctx, char *field, double value);
 int REDISMODULE_API_FUNC(RedisModule_InfoAddFieldLongLong)(RedisModuleInfoCtx *ctx, char *field, long long value);
 int REDISMODULE_API_FUNC(RedisModule_InfoAddFieldULongLong)(RedisModuleInfoCtx *ctx, char *field, unsigned long long value);
+int REDISMODULE_API_FUNC(RedisModule_SubscribeToServerEvent)(RedisModuleCtx *ctx, RedisModuleEvent event, RedisModuleEventCallback callback);
 
 /* Experimental APIs */
 #ifdef REDISMODULE_EXPERIMENTAL_API
@@ -424,14 +562,17 @@ static int RedisModule_Init(RedisModuleCtx *ctx, const char *name, int ver, int 
     REDISMODULE_GET_API(ReplyWithError);
     REDISMODULE_GET_API(ReplyWithSimpleString);
     REDISMODULE_GET_API(ReplyWithArray);
+    REDISMODULE_GET_API(ReplyWithNullArray);
+    REDISMODULE_GET_API(ReplyWithEmptyArray);
     REDISMODULE_GET_API(ReplySetArrayLength);
     REDISMODULE_GET_API(ReplyWithStringBuffer);
     REDISMODULE_GET_API(ReplyWithCString);
     REDISMODULE_GET_API(ReplyWithString);
+    REDISMODULE_GET_API(ReplyWithEmptyString);
+    REDISMODULE_GET_API(ReplyWithVerbatimString);
     REDISMODULE_GET_API(ReplyWithNull);
     REDISMODULE_GET_API(ReplyWithCallReply);
     REDISMODULE_GET_API(ReplyWithDouble);
-    REDISMODULE_GET_API(ReplySetArrayLength);
     REDISMODULE_GET_API(GetSelectedDb);
     REDISMODULE_GET_API(SelectDb);
     REDISMODULE_GET_API(OpenKey);
@@ -509,11 +650,13 @@ static int RedisModule_Init(RedisModuleCtx *ctx, const char *name, int ver, int 
     REDISMODULE_GET_API(Log);
     REDISMODULE_GET_API(LogIOError);
     REDISMODULE_GET_API(_Assert);
+    REDISMODULE_GET_API(LatencyAddSample);
     REDISMODULE_GET_API(StringAppendBuffer);
     REDISMODULE_GET_API(RetainString);
     REDISMODULE_GET_API(StringCompare);
     REDISMODULE_GET_API(GetContextFromIO);
     REDISMODULE_GET_API(GetKeyNameFromIO);
+    REDISMODULE_GET_API(GetKeyNameFromModuleKey);
     REDISMODULE_GET_API(Milliseconds);
     REDISMODULE_GET_API(DigestAddStringBuffer);
     REDISMODULE_GET_API(DigestAddLongLong);
@@ -549,6 +692,8 @@ static int RedisModule_Init(RedisModuleCtx *ctx, const char *name, int ver, int 
     REDISMODULE_GET_API(InfoAddFieldDouble);
     REDISMODULE_GET_API(InfoAddFieldLongLong);
     REDISMODULE_GET_API(InfoAddFieldULongLong);
+    REDISMODULE_GET_API(GetClientInfoById);
+    REDISMODULE_GET_API(SubscribeToServerEvent);
 
 #ifdef REDISMODULE_EXPERIMENTAL_API
     REDISMODULE_GET_API(GetThreadSafeContext);
@@ -564,6 +709,8 @@ static int RedisModule_Init(RedisModuleCtx *ctx, const char *name, int ver, int 
     REDISMODULE_GET_API(AbortBlock);
     REDISMODULE_GET_API(SetDisconnectCallback);
     REDISMODULE_GET_API(SubscribeToKeyspaceEvents);
+    REDISMODULE_GET_API(NotifyKeyspaceEvent);
+    REDISMODULE_GET_API(GetNotifyKeyspaceEvents);
     REDISMODULE_GET_API(BlockedClientDisconnected);
     REDISMODULE_GET_API(RegisterClusterMessageReceiver);
     REDISMODULE_GET_API(SendClusterMessage);

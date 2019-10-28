@@ -33,9 +33,6 @@
 #include <dlfcn.h>
 #include <sys/wait.h>
 
-#define REDISMODULE_CORE 1
-#include "redismodule.h"
-
 /* --------------------------------------------------------------------------
  * Private data structures used by the modules system. Those are data
  * structures that are never exposed to Redis Modules, if not as void
@@ -64,8 +61,10 @@ struct RedisModule {
     list *using;    /* List of modules we use some APIs of. */
     list *filters;  /* List of filters the module has registered. */
     int in_call;    /* RM_Call() nesting level */
+    int in_hook;    /* Hooks callback nesting level for this module (0 or 1). */
     int options;    /* Module options and capabilities. */
-    RedisModuleInfoFunc info_cb;     /* callback for module to add INFO fields. */
+    int blocked_clients;         /* Count of RedisModuleBlockedClient in this module. */
+    RedisModuleInfoFunc info_cb; /* Callback for module to add INFO fields. */
 };
 typedef struct RedisModule RedisModule;
 
@@ -322,6 +321,21 @@ static struct RedisModuleForkInfo {
 #define REDISMODULE_ARGV_REPLICATE (1<<0)
 #define REDISMODULE_ARGV_NO_AOF (1<<1)
 #define REDISMODULE_ARGV_NO_REPLICAS (1<<2)
+
+/* Server events hooks data structures and defines: this modules API
+ * allow modules to subscribe to certain events in Redis, such as
+ * the start and end of an RDB or AOF save, the change of role in replication,
+ * and similar other events. */
+
+typedef struct RedisModuleEventListener {
+    RedisModule *module;
+    RedisModuleEvent event;
+    RedisModuleEventCallback callback;
+} RedisModuleEventListener;
+
+list *RedisModule_EventListeners; /* Global list of all the active events. */
+unsigned long long ModulesInHooks = 0; /* Total number of modules in hooks
+                                          callbacks right now. */
 
 /* --------------------------------------------------------------------------
  * Prototypes
@@ -807,6 +821,7 @@ void RM_SetModuleAttribs(RedisModuleCtx *ctx, const char *name, int ver, int api
     module->using = listCreate();
     module->filters = listCreate();
     module->in_call = 0;
+    module->in_hook = 0;
     ctx->module = module;
 }
 
@@ -1250,6 +1265,27 @@ int RM_ReplyWithArray(RedisModuleCtx *ctx, long len) {
     return REDISMODULE_OK;
 }
 
+/* Reply to the client with a null array, simply null in RESP3 
+ * null array in RESP2.
+ *
+ * The function always returns REDISMODULE_OK. */
+int RM_ReplyWithNullArray(RedisModuleCtx *ctx) {
+    client *c = moduleGetReplyClient(ctx);
+    if (c == NULL) return REDISMODULE_OK;
+    addReplyNullArray(c);
+    return REDISMODULE_OK;
+}
+
+/* Reply to the client with an empty array. 
+ *
+ * The function always returns REDISMODULE_OK. */
+int RM_ReplyWithEmptyArray(RedisModuleCtx *ctx) {
+    client *c = moduleGetReplyClient(ctx);
+    if (c == NULL) return REDISMODULE_OK;
+    addReply(c,shared.emptyarray);
+    return REDISMODULE_OK;
+}
+
 /* When RedisModule_ReplyWithArray() is used with the argument
  * REDISMODULE_POSTPONED_ARRAY_LEN, because we don't know beforehand the number
  * of items we are going to output as elements of the array, this function
@@ -1325,6 +1361,27 @@ int RM_ReplyWithString(RedisModuleCtx *ctx, RedisModuleString *str) {
     client *c = moduleGetReplyClient(ctx);
     if (c == NULL) return REDISMODULE_OK;
     addReplyBulk(c,str);
+    return REDISMODULE_OK;
+}
+
+/* Reply with an empty string.
+ *
+ * The function always returns REDISMODULE_OK. */
+int RM_ReplyWithEmptyString(RedisModuleCtx *ctx) {
+    client *c = moduleGetReplyClient(ctx);
+    if (c == NULL) return REDISMODULE_OK;
+    addReplyBulkCBuffer(c, "", 0);
+    return REDISMODULE_OK;
+}
+
+/* Reply with a binary safe string, which should not be escaped or filtered 
+ * taking in input a C buffer pointer and length.
+ *
+ * The function always returns REDISMODULE_OK. */
+int RM_ReplyWithVerbatimString(RedisModuleCtx *ctx, const char *buf, size_t len) {
+    client *c = moduleGetReplyClient(ctx);
+    if (c == NULL) return REDISMODULE_OK;
+    addReplyVerbatim(c, buf, len, "txt");
     return REDISMODULE_OK;
 }
 
@@ -1516,6 +1573,89 @@ int RM_ReplicateVerbatim(RedisModuleCtx *ctx) {
 unsigned long long RM_GetClientId(RedisModuleCtx *ctx) {
     if (ctx->client == NULL) return 0;
     return ctx->client->id;
+}
+
+/* This is an helper for RM_GetClientInfoById() and other functions: given
+ * a client, it populates the client info structure with the appropriate
+ * fields depending on the version provided. If the version is not valid
+ * then REDISMODULE_ERR is returned. Otherwise the function returns
+ * REDISMODULE_OK and the structure pointed by 'ci' gets populated. */
+
+int modulePopulateClientInfoStructure(void *ci, client *client, int structver) {
+    if (structver != 1) return REDISMODULE_ERR;
+
+    RedisModuleClientInfoV1 *ci1 = ci;
+    memset(ci1,0,sizeof(*ci1));
+    ci1->version = structver;
+    if (client->flags & CLIENT_MULTI)
+        ci1->flags |= REDISMODULE_CLIENTINFO_FLAG_MULTI;
+    if (client->flags & CLIENT_PUBSUB)
+        ci1->flags |= REDISMODULE_CLIENTINFO_FLAG_PUBSUB;
+    if (client->flags & CLIENT_UNIX_SOCKET)
+        ci1->flags |= REDISMODULE_CLIENTINFO_FLAG_UNIXSOCKET;
+    if (client->flags & CLIENT_TRACKING)
+        ci1->flags |= REDISMODULE_CLIENTINFO_FLAG_TRACKING;
+    if (client->flags & CLIENT_BLOCKED)
+        ci1->flags |= REDISMODULE_CLIENTINFO_FLAG_BLOCKED;
+
+    int port;
+    connPeerToString(client->conn,ci1->addr,sizeof(ci1->addr),&port);
+    ci1->port = port;
+    ci1->db = client->db->id;
+    ci1->id = client->id;
+    return REDISMODULE_OK;
+}
+
+/* Return information about the client with the specified ID (that was
+ * previously obtained via the RedisModule_GetClientId() API). If the
+ * client exists, REDISMODULE_OK is returned, otherwise REDISMODULE_ERR
+ * is returned.
+ *
+ * When the client exist and the `ci` pointer is not NULL, but points to
+ * a structure of type RedisModuleClientInfo, previously initialized with
+ * the correct REDISMODULE_CLIENTINFO_INITIALIZER, the structure is populated
+ * with the following fields:
+ *
+ *      uint64_t flags;         // REDISMODULE_CLIENTINFO_FLAG_*
+ *      uint64_t id;            // Client ID
+ *      char addr[46];          // IPv4 or IPv6 address.
+ *      uint16_t port;          // TCP port.
+ *      uint16_t db;            // Selected DB.
+ *
+ * Note: the client ID is useless in the context of this call, since we
+ *       already know, however the same structure could be used in other
+ *       contexts where we don't know the client ID, yet the same structure
+ *       is returned.
+ *
+ * With flags having the following meaning:
+ *
+ *     REDISMODULE_CLIENTINFO_FLAG_SSL          Client using SSL connection.
+ *     REDISMODULE_CLIENTINFO_FLAG_PUBSUB       Client in Pub/Sub mode.
+ *     REDISMODULE_CLIENTINFO_FLAG_BLOCKED      Client blocked in command.
+ *     REDISMODULE_CLIENTINFO_FLAG_TRACKING     Client with keys tracking on.
+ *     REDISMODULE_CLIENTINFO_FLAG_UNIXSOCKET   Client using unix domain socket.
+ *     REDISMODULE_CLIENTINFO_FLAG_MULTI        Client in MULTI state.
+ *
+ * However passing NULL is a way to just check if the client exists in case
+ * we are not interested in any additional information.
+ *
+ * This is the correct usage when we want the client info structure
+ * returned:
+ *
+ *      RedisModuleClientInfo ci = REDISMODULE_CLIENTINFO_INITIALIZER;
+ *      int retval = RedisModule_GetClientInfoById(&ci,client_id);
+ *      if (retval == REDISMODULE_OK) {
+ *          printf("Address: %s\n", ci.addr);
+ *      }
+ */
+int RM_GetClientInfoById(void *ci, uint64_t id) {
+    client *client = lookupClientByID(id);
+    if (client == NULL) return REDISMODULE_ERR;
+    if (ci == NULL) return REDISMODULE_OK;
+
+    /* Fill the info structure if passed. */
+    uint64_t structver = ((uint64_t*)ci)[0];
+    return modulePopulateClientInfoStructure(ci,client,structver);
 }
 
 /* Return the currently selected DB. */
@@ -2853,7 +2993,7 @@ robj **moduleCreateArgvFromUserFormat(const char *cmdname, const char *fmt, int 
             size_t len = va_arg(ap,size_t);
             argv[argc++] = createStringObject(buf,len);
         } else if (*p == 'l') {
-            long ll = va_arg(ap,long long);
+            long long ll = va_arg(ap,long long);
             argv[argc++] = createObject(OBJ_STRING,sdsfromlonglong(ll));
         } else if (*p == 'v') {
              /* A vector of strings */
@@ -3719,6 +3859,11 @@ const RedisModuleString *RM_GetKeyNameFromIO(RedisModuleIO *io) {
     return io->key;
 }
 
+/* Returns a RedisModuleString with the name of the key from RedisModuleKey */
+const RedisModuleString *RM_GetKeyNameFromModuleKey(RedisModuleKey *key) {
+    return key ? key->key : NULL;
+}
+
 /* --------------------------------------------------------------------------
  * Logging
  * -------------------------------------------------------------------------- */
@@ -3793,6 +3938,14 @@ void RM__Assert(const char *estr, const char *file, int line) {
     _serverAssert(estr, file, line);
 }
 
+/* Allows adding event to the latency monitor to be observed by the LATENCY
+ * command. The call is skipped if the latency is smaller than the configured
+ * latency-monitor-threshold. */
+void RM_LatencyAddSample(const char *event, mstime_t latency) {
+    if (latency >= server.latency_monitor_threshold)
+        latencyAddSample(event, latency);
+}
+
 /* --------------------------------------------------------------------------
  * Blocking clients from modules
  * -------------------------------------------------------------------------- */
@@ -3864,6 +4017,7 @@ RedisModuleBlockedClient *RM_BlockClient(RedisModuleCtx *ctx, RedisModuleCmdFunc
 
     c->bpop.module_blocked_handle = zmalloc(sizeof(RedisModuleBlockedClient));
     RedisModuleBlockedClient *bc = c->bpop.module_blocked_handle;
+    ctx->module->blocked_clients++;
 
     /* We need to handle the invalid operation of calling modules blocking
      * commands from Lua or MULTI. We actually create an already aborted
@@ -4022,6 +4176,7 @@ void moduleHandleBlockedClients(void) {
         /* Free 'bc' only after unblocking the client, since it is
          * referenced in the client blocking context, and must be valid
          * when calling unblockClient(). */
+        bc->module->blocked_clients--;
         zfree(bc);
 
         /* Lock again before to iterate the loop. */
@@ -4215,6 +4370,20 @@ int RM_SubscribeToKeyspaceEvents(RedisModuleCtx *ctx, int types, RedisModuleNoti
     sub->active = 0;
 
     listAddNodeTail(moduleKeyspaceSubscribers, sub);
+    return REDISMODULE_OK;
+}
+
+/* Get the configured bitmap of notify-keyspace-events (Could be used
+ * for additional filtering in RedisModuleNotificationFunc) */
+int RM_GetNotifyKeyspaceEvents() {
+    return server.notify_keyspace_events;
+}
+
+/* Expose notifyKeyspaceEvent to modules */
+int RM_NotifyKeyspaceEvent(RedisModuleCtx *ctx, int type, const char *event, RedisModuleString *key) {
+    if (!ctx || !ctx->client)
+        return REDISMODULE_ERR;
+    notifyKeyspaceEvent(type, (char *)event, key, ctx->client->db->id);
     return REDISMODULE_OK;
 }
 
@@ -5551,6 +5720,283 @@ void ModuleForkDoneHandler(int exitcode, int bysignal) {
 }
 
 /* --------------------------------------------------------------------------
+ * Server hooks implementation
+ * -------------------------------------------------------------------------- */
+
+/* Register to be notified, via a callback, when the specified server event
+ * happens. The callback is called with the event as argument, and an additional
+ * argument which is a void pointer and should be cased to a specific type
+ * that is event-specific (but many events will just use NULL since they do not
+ * have additional information to pass to the callback).
+ *
+ * If the callback is NULL and there was a previous subscription, the module
+ * will be unsubscribed. If there was a previous subscription and the callback
+ * is not null, the old callback will be replaced with the new one.
+ *
+ * The callback must be of this type:
+ *
+ *  int (*RedisModuleEventCallback)(RedisModuleCtx *ctx,
+ *                                  RedisModuleEvent eid,
+ *                                  uint64_t subevent,
+ *                                  void *data);
+ *
+ * The 'ctx' is a normal Redis module context that the callback can use in
+ * order to call other modules APIs. The 'eid' is the event itself, this
+ * is only useful in the case the module subscribed to multiple events: using
+ * the 'id' field of this structure it is possible to check if the event
+ * is one of the events we registered with this callback. The 'subevent' field
+ * depends on the event that fired.
+ *
+ * Finally the 'data' pointer may be populated, only for certain events, with
+ * more relevant data.
+ *
+ * Here is a list of events you can use as 'eid' and related sub events:
+ *
+ *      RedisModuleEvent_ReplicationRoleChanged
+ *
+ *          This event is called when the instance switches from master
+ *          to replica or the other way around, however the event is
+ *          also called when the replica remains a replica but starts to
+ *          replicate with a different master.
+ *
+ *          The following sub events are available:
+ *
+ *              REDISMODULE_EVENT_REPLROLECHANGED_NOW_MASTER
+ *              REDISMODULE_EVENT_REPLROLECHANGED_NOW_REPLICA
+ *
+ *          The 'data' field can be casted by the callback to a
+ *          RedisModuleReplicationInfo structure with the following fields:
+ *
+ *              int master; // true if master, false if replica
+ *              char *masterhost; // master instance hostname for NOW_REPLICA
+ *              int masterport; // master instance port for NOW_REPLICA
+ *              char *replid1; // Main replication ID
+ *              char *replid2; // Secondary replication ID
+ *              uint64_t repl2_offset; // Offset of replid2 validity
+ *              uint64_t main_repl_offset; // Replication offset
+ *
+ *      RedisModuleEvent_Persistence
+ *
+ *          This event is called when RDB saving or AOF rewriting starts
+ *          and ends. The following sub events are available:
+ *
+ *              REDISMODULE_EVENT_LOADING_RDB_START        // BGSAVE start
+ *              REDISMODULE_EVENT_LOADING_RDB_END          // BGSAVE end
+ *              REDISMODULE_EVENT_LOADING_SYNC_RDB_START   // SAVE start
+ *              REDISMODULE_EVENT_LOADING_SYNC_RDB_START   // SAVE end
+ *              REDISMODULE_EVENT_LOADING_AOF_START        // AOF rewrite start
+ *              REDISMODULE_EVENT_LOADING_AOF_END          // AOF rewrite end
+ *
+ *          The above events are triggered not just when the user calls the
+ *          relevant commands like BGSAVE, but also when a saving operation
+ *          or AOF rewriting occurs because of internal server triggers.
+ *
+ *      RedisModuleEvent_FlushDB
+ *
+ *          The FLUSHALL, FLUSHDB or an internal flush (for instance
+ *          because of replication, after the replica synchronization)
+ *          happened. The following sub events are available:
+ *
+ *              REDISMODULE_EVENT_FLUSHDB_START
+ *              REDISMODULE_EVENT_FLUSHDB_END
+ *
+ *          The data pointer can be casted to a RedisModuleFlushInfo
+ *          structure with the following fields:
+ *
+ *              int32_t async;  // True if the flush is done in a thread.
+ *                                 See for instance FLUSHALL ASYNC.
+ *                                 In this case the END callback is invoked
+ *                                 immediately after the database is put
+ *                                 in the free list of the thread.
+ *              int32_t dbnum;  // Flushed database number, -1 for all the DBs
+ *                                 in the case of the FLUSHALL operation.
+ *
+ *          The start event is called *before* the operation is initated, thus
+ *          allowing the callback to call DBSIZE or other operation on the
+ *          yet-to-free keyspace.
+ *
+ *      RedisModuleEvent_Loading
+ *
+ *          Called on loading operations: at startup when the server is
+ *          started, but also after a first synchronization when the
+ *          replica is loading the RDB file from the master.
+ *          The following sub events are available:
+ *
+ *              REDISMODULE_EVENT_LOADING_RDB_START
+ *              REDISMODULE_EVENT_LOADING_RDB_END
+ *              REDISMODULE_EVENT_LOADING_MASTER_RDB_START
+ *              REDISMODULE_EVENT_LOADING_MASTER_RDB_END
+ *              REDISMODULE_EVENT_LOADING_AOF_START
+ *              REDISMODULE_EVENT_LOADING_AOF_END
+ *
+ *      RedisModuleEvent_ClientChange
+ *
+ *          Called when a client connects or disconnects.
+ *          The data pointer can be casted to a RedisModuleClientInfo
+ *          structure, documented in RedisModule_GetClientInfoById().
+ *          The following sub events are available:
+ *
+ *              REDISMODULE_EVENT_CLIENT_CHANGE_CONNECTED
+ *              REDISMODULE_EVENT_CLIENT_CHANGE_DISCONNECTED
+ *
+ *      RedisModuleEvent_Shutdown
+ *
+ *          The server is shutting down. No subevents are available.
+ *
+ *  RedisModuleEvent_ReplicaChange
+ *
+ *          This event is called when the instance (that can be both a
+ *          master or a replica) get a new online replica, or lose a
+ *          replica since it gets disconnected.
+ *          The following sub events are availble:
+ *
+ *              REDISMODULE_EVENT_REPLICA_CHANGE_ONLINE
+ *              REDISMODULE_EVENT_REPLICA_CHANGE_OFFLINE
+ *
+ *          No additional information is available so far: future versions
+ *          of Redis will have an API in order to enumerate the replicas
+ *          connected and their state.
+ *
+ *  RedisModuleEvent_CronLoop
+ *
+ *          This event is called every time Redis calls the serverCron()
+ *          function in order to do certain bookkeeping. Modules that are
+ *          required to do operations from time to time may use this callback.
+ *          Normally Redis calls this function 10 times per second, but
+ *          this changes depending on the "hz" configuration.
+ *          No sub events are available.
+ *
+ *  RedisModuleEvent_MasterLinkChange
+ *
+ *          This is called for replicas in order to notify when the
+ *          replication link becomes functional (up) with our master,
+ *          or when it goes down. Note that the link is not considered
+ *          up when we just connected to the master, but only if the
+ *          replication is happening correctly.
+ *          The following sub events are available:
+ *
+ *              REDISMODULE_EVENT_MASTER_LINK_UP
+ *              REDISMODULE_EVENT_MASTER_LINK_DOWN
+ *
+ * The function returns REDISMODULE_OK if the module was successfully subscrived
+ * for the specified event. If the API is called from a wrong context then
+ * REDISMODULE_ERR is returned. */
+int RM_SubscribeToServerEvent(RedisModuleCtx *ctx, RedisModuleEvent event, RedisModuleEventCallback callback) {
+    RedisModuleEventListener *el;
+
+    /* Protect in case of calls from contexts without a module reference. */
+    if (ctx->module == NULL) return REDISMODULE_ERR;
+
+    /* Search an event matching this module and event ID. */
+    listIter li;
+    listNode *ln;
+    listRewind(RedisModule_EventListeners,&li);
+    while((ln = listNext(&li))) {
+        el = ln->value;
+        if (el->module == ctx->module && el->event.id == event.id)
+            break; /* Matching event found. */
+    }
+
+    /* Modify or remove the event listener if we already had one. */
+    if (ln) {
+        if (callback == NULL) {
+            listDelNode(RedisModule_EventListeners,ln);
+            zfree(el);
+        } else {
+            el->callback = callback; /* Update the callback with the new one. */
+        }
+        return REDISMODULE_OK;
+    }
+
+    /* No event found, we need to add a new one. */
+    el = zmalloc(sizeof(*el));
+    el->module = ctx->module;
+    el->event = event;
+    el->callback = callback;
+    listAddNodeTail(RedisModule_EventListeners,el);
+    return REDISMODULE_OK;
+}
+
+/* This is called by the Redis internals every time we want to fire an
+ * event that can be interceppted by some module. The pointer 'data' is useful
+ * in order to populate the event-specific structure when needed, in order
+ * to return the structure with more information to the callback.
+ *
+ * 'eid' and 'subid' are just the main event ID and the sub event associated
+ * with the event, depending on what exactly happened. */
+void moduleFireServerEvent(uint64_t eid, int subid, void *data) {
+    /* Fast path to return ASAP if there is nothing to do, avoiding to
+     * setup the iterator and so forth: we want this call to be extremely
+     * cheap if there are no registered modules. */
+    if (listLength(RedisModule_EventListeners) == 0) return;
+
+    listIter li;
+    listNode *ln;
+    listRewind(RedisModule_EventListeners,&li);
+    while((ln = listNext(&li))) {
+        RedisModuleEventListener *el = ln->value;
+        if (el->event.id == eid && !el->module->in_hook) {
+            RedisModuleCtx ctx = REDISMODULE_CTX_INIT;
+            ctx.module = el->module;
+
+            if (ModulesInHooks == 0) {
+                ctx.client = moduleFreeContextReusedClient;
+            } else {
+                ctx.client = createClient(NULL);
+                ctx.client->flags |= CLIENT_MODULE;
+                ctx.client->user = NULL; /* Root user. */
+            }
+
+            void *moduledata = NULL;
+            RedisModuleClientInfoV1 civ1;
+            /* Start at DB zero by default when calling the handler. It's
+             * up to the specific event setup to change it when it makes
+             * sense. For instance for FLUSHDB events we select the correct
+             * DB automatically. */
+            selectDb(ctx.client, 0);
+
+            /* Event specific context and data pointer setup. */
+            if (eid == REDISMODULE_EVENT_CLIENT_CHANGE) {
+                modulePopulateClientInfoStructure(&civ1,data,
+                                                  el->event.dataver);
+                moduledata = &civ1;
+            } else if (eid == REDISMODULE_EVENT_FLUSHDB) {
+                moduledata = data;
+                RedisModuleFlushInfoV1 *fi = data;
+                if (fi->dbnum != -1)
+                    selectDb(ctx.client, fi->dbnum);
+            }
+
+            ModulesInHooks++;
+            el->module->in_hook++;
+            el->callback(&ctx,el->event,subid,moduledata);
+            el->module->in_hook--;
+            ModulesInHooks--;
+
+            if (ModulesInHooks != 0) freeClient(ctx.client);
+            moduleFreeContext(&ctx);
+        }
+    }
+}
+
+/* Remove all the listeners for this module: this is used before unloading
+ * a module. */
+void moduleUnsubscribeAllServerEvents(RedisModule *module) {
+    RedisModuleEventListener *el;
+    listIter li;
+    listNode *ln;
+    listRewind(RedisModule_EventListeners,&li);
+
+    while((ln = listNext(&li))) {
+        el = ln->value;
+        if (el->module == module) {
+            listDelNode(RedisModule_EventListeners,ln);
+            zfree(el);
+        }
+    }
+}
+
+/* --------------------------------------------------------------------------
  * Modules API internals
  * -------------------------------------------------------------------------- */
 
@@ -5613,6 +6059,9 @@ void moduleInitModulesSystem(void) {
 
     /* Create the timers radix tree. */
     Timers = raxNew();
+
+    /* Setup the event listeners data structures. */
+    RedisModule_EventListeners = listCreate();
 
     /* Our thread-safe contexts GIL must start with already locked:
      * it is just unlocked when it's safe. */
@@ -5712,6 +6161,7 @@ int moduleLoad(const char *path, void **module_argv, int module_argc) {
 
     /* Redis module loaded! Register it. */
     dictAdd(modules,ctx.module->name,ctx.module);
+    ctx.module->blocked_clients = 0;
     ctx.module->handle = handle;
     serverLog(LL_NOTICE,"Module '%s' loaded from %s",ctx.module->name,path);
     moduleFreeContext(&ctx);
@@ -5737,8 +6187,11 @@ int moduleUnload(sds name) {
     } else if (listLength(module->usedby)) {
         errno = EPERM;
         return REDISMODULE_ERR;
+    } else if (module->blocked_clients) {
+        errno = EAGAIN;
+        return REDISMODULE_ERR;
     }
-    
+
     /* Give module a chance to clean up. */
     int (*onunload)(void *);
     onunload = (int (*)(void *))(unsigned long) dlsym(module->handle, "RedisModule_OnUnload");
@@ -5763,8 +6216,7 @@ int moduleUnload(sds name) {
 
     /* Remove any notification subscribers this module might have */
     moduleUnsubscribeNotifications(module);
-
-    /* Unregister all the hooks. TODO: Yet no hooks support here. */
+    moduleUnsubscribeAllServerEvents(module);
 
     /* Unload the dynamic library. */
     if (dlclose(module->handle) == -1) {
@@ -5903,6 +6355,10 @@ NULL
                 errmsg = "the module exports APIs used by other modules. "
                          "Please unload them first and try again";
                 break;
+            case EAGAIN:
+                errmsg = "the module has blocked clients. "
+                         "Please wait them unblocked and try again";
+                break;
             default:
                 errmsg = "operation not possible.";
                 break;
@@ -5940,8 +6396,12 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(ReplyWithError);
     REGISTER_API(ReplyWithSimpleString);
     REGISTER_API(ReplyWithArray);
+    REGISTER_API(ReplyWithNullArray);
+    REGISTER_API(ReplyWithEmptyArray);
     REGISTER_API(ReplySetArrayLength);
     REGISTER_API(ReplyWithString);
+    REGISTER_API(ReplyWithEmptyString);
+    REGISTER_API(ReplyWithVerbatimString);
     REGISTER_API(ReplyWithStringBuffer);
     REGISTER_API(ReplyWithCString);
     REGISTER_API(ReplyWithNull);
@@ -6024,11 +6484,13 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(Log);
     REGISTER_API(LogIOError);
     REGISTER_API(_Assert);
+    REGISTER_API(LatencyAddSample);
     REGISTER_API(StringAppendBuffer);
     REGISTER_API(RetainString);
     REGISTER_API(StringCompare);
     REGISTER_API(GetContextFromIO);
     REGISTER_API(GetKeyNameFromIO);
+    REGISTER_API(GetKeyNameFromModuleKey);
     REGISTER_API(BlockClient);
     REGISTER_API(UnblockClient);
     REGISTER_API(IsBlockedReplyRequest);
@@ -6043,6 +6505,8 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(DigestAddStringBuffer);
     REGISTER_API(DigestAddLongLong);
     REGISTER_API(DigestEndSequence);
+    REGISTER_API(NotifyKeyspaceEvent);
+    REGISTER_API(GetNotifyKeyspaceEvents);
     REGISTER_API(SubscribeToKeyspaceEvents);
     REGISTER_API(RegisterClusterMessageReceiver);
     REGISTER_API(SendClusterMessage);
@@ -6103,4 +6567,6 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(InfoAddFieldDouble);
     REGISTER_API(InfoAddFieldLongLong);
     REGISTER_API(InfoAddFieldULongLong);
+    REGISTER_API(GetClientInfoById);
+    REGISTER_API(SubscribeToServerEvent);
 }
