@@ -36,6 +36,7 @@
 
 static void setProtocolError(const char *errstr, client *c);
 int postponeClientRead(client *c);
+int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 
 /* Return the size consumed from the allocator, for the specified SDS string,
  * including internal fragmentation. This function is used in order to compute
@@ -1365,6 +1366,12 @@ void resetClient(client *c) {
     if (!(c->flags & CLIENT_MULTI) && prevcmd != askingCommand)
         c->flags &= ~CLIENT_ASKING;
 
+    /* We do the same for the CACHING command as well. It also affects
+     * the next command or transaction executed, in a way very similar
+     * to ASKING. */
+    if (!(c->flags & CLIENT_MULTI) && prevcmd != clientCommand)
+        c->flags &= ~CLIENT_TRACKING_CACHING;
+
     /* Remove the CLIENT_REPLY_SKIP flag if any so that the reply
      * to the next command will be sent, but set the flag if the command
      * we just processed was "CLIENT REPLY SKIP". */
@@ -2044,7 +2051,7 @@ void clientCommand(client *c) {
 "REPLY (on|off|skip)    -- Control the replies sent to the current connection.",
 "SETNAME <name>         -- Assign the name <name> to the current connection.",
 "UNBLOCK <clientid> [TIMEOUT|ERROR] -- Unblock the specified blocked client.",
-"TRACKING (on|off) [REDIRECT <id>] -- Enable client keys tracking for client side caching.",
+"TRACKING (on|off) [REDIRECT <id>] [BCAST] [PREFIX first] [PREFIX second] [OPTIN] [OPTOUT]... -- Enable client keys tracking for client side caching.",
 "GETREDIR               -- Return the client ID we are redirecting to when tracking is enabled.",
 NULL
         };
@@ -2221,9 +2228,9 @@ NULL
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"tracking") && c->argc >= 3) {
         /* CLIENT TRACKING (on|off) [REDIRECT <id>] [BCAST] [PREFIX first]
-         *                          [PREFIX second] ... */
+         *                          [PREFIX second] [OPTIN] [OPTOUT] ... */
         long long redir = 0;
-        int bcast = 0;
+        uint64_t options = 0;
         robj **prefix = NULL;
         size_t numprefix = 0;
 
@@ -2233,18 +2240,34 @@ NULL
 
             if (!strcasecmp(c->argv[j]->ptr,"redirect") && moreargs) {
                 j++;
+                if (redir != 0) {
+                    addReplyError(c,"A client can only redirect to a single "
+                                    "other client");
+                    zfree(prefix);
+                    return;
+                }
+
                 if (getLongLongFromObjectOrReply(c,c->argv[j],&redir,NULL) !=
-                    C_OK) return;
+                    C_OK)
+                {
+                    zfree(prefix);
+                    return;
+                }
                 /* We will require the client with the specified ID to exist
                  * right now, even if it is possible that it gets disconnected
                  * later. Still a valid sanity check. */
                 if (lookupClientByID(redir) == NULL) {
                     addReplyError(c,"The client ID you want redirect to "
                                     "does not exist");
+                    zfree(prefix);
                     return;
                 }
             } else if (!strcasecmp(c->argv[j]->ptr,"bcast")) {
-                bcast++;
+                options |= CLIENT_TRACKING_BCAST;
+            } else if (!strcasecmp(c->argv[j]->ptr,"optin")) {
+                options |= CLIENT_TRACKING_OPTIN;
+            } else if (!strcasecmp(c->argv[j]->ptr,"optout")) {
+                options |= CLIENT_TRACKING_OPTOUT;
             } else if (!strcasecmp(c->argv[j]->ptr,"prefix") && moreargs) {
                 j++;
                 prefix = zrealloc(prefix,sizeof(robj*)*(numprefix+1));
@@ -2260,7 +2283,7 @@ NULL
         if (!strcasecmp(c->argv[2]->ptr,"on")) {
             /* Before enabling tracking, make sure options are compatible
              * among each other and with the current state of the client. */
-            if (!bcast && numprefix) {
+            if (!(options & CLIENT_TRACKING_BCAST) && numprefix) {
                 addReplyError(c,
                     "PREFIX option requires BCAST mode to be enabled");
                 zfree(prefix);
@@ -2269,7 +2292,8 @@ NULL
 
             if (c->flags & CLIENT_TRACKING) {
                 int oldbcast = !!(c->flags & CLIENT_TRACKING_BCAST);
-                if (oldbcast != bcast) {
+                int newbcast = !!(options & CLIENT_TRACKING_BCAST);
+                if (oldbcast != newbcast) {
                     addReplyError(c,
                     "You can't switch BCAST mode on/off before disabling "
                     "tracking for this client, and then re-enabling it with "
@@ -2278,7 +2302,17 @@ NULL
                     return;
                 }
             }
-            enableTracking(c,redir,bcast,prefix,numprefix);
+
+            if (options & CLIENT_TRACKING_BCAST &&
+                options & (CLIENT_TRACKING_OPTIN|CLIENT_TRACKING_OPTOUT))
+            {
+                addReplyError(c,
+                "OPTIN and OPTOUT are not compatible with BCAST");
+                zfree(prefix);
+                return;
+            }
+
+            enableTracking(c,redir,options,prefix,numprefix);
         } else if (!strcasecmp(c->argv[2]->ptr,"off")) {
             disableTracking(c);
         } else {
@@ -2287,6 +2321,36 @@ NULL
             return;
         }
         zfree(prefix);
+        addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"caching") && c->argc >= 3) {
+        if (!(c->flags & CLIENT_TRACKING)) {
+            addReplyError(c,"CLIENT CACHING can be called only when the "
+                            "client is in tracking mode with OPTIN or "
+                            "OPTOUT mode enabled");
+            return;
+        }
+
+        char *opt = c->argv[2]->ptr;
+        if (!strcasecmp(opt,"yes")) {
+            if (c->flags & CLIENT_TRACKING_OPTIN) {
+                c->flags |= CLIENT_TRACKING_CACHING;
+            } else {
+                addReplyError(c,"CLIENT CACHING YES is only valid when tracking is enabled in OPTIN mode.");
+                return;
+            }
+        } else if (!strcasecmp(opt,"no")) {
+            if (c->flags & CLIENT_TRACKING_OPTOUT) {
+                c->flags |= CLIENT_TRACKING_CACHING;
+            } else {
+                addReplyError(c,"CLIENT CACHING NO is only valid when tracking is enabled in OPTOUT mode.");
+                return;
+            }
+        } else {
+            addReply(c,shared.syntaxerr);
+            return;
+        }
+
+        /* Common reply for when we succeeded. */
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"getredir") && c->argc == 2) {
         /* CLIENT GETREDIR */
@@ -2675,6 +2739,12 @@ int clientsArePaused(void) {
 int processEventsWhileBlocked(void) {
     int iterations = 4; /* See the function top-comment. */
     int count = 0;
+
+    /* Note: when we are processing events while blocked (for instance during
+     * busy Lua scripts), we set a global flag. When such flag is set, we
+     * avoid handling the read part of clients using threaded I/O.
+     * See https://github.com/antirez/redis/issues/6988 for more info. */
+    ProcessingEventsWhileBlocked = 1;
     while (iterations--) {
         int events = 0;
         events += aeProcessEvents(server.el, AE_FILE_EVENTS|AE_DONT_WAIT);
@@ -2682,6 +2752,7 @@ int processEventsWhileBlocked(void) {
         if (!events) break;
         count += events;
     }
+    ProcessingEventsWhileBlocked = 0;
     return count;
 }
 
@@ -2907,6 +2978,7 @@ int handleClientsWithPendingWritesUsingThreads(void) {
 int postponeClientRead(client *c) {
     if (io_threads_active &&
         server.io_threads_do_reads &&
+        !ProcessingEventsWhileBlocked &&
         !(c->flags & (CLIENT_MASTER|CLIENT_SLAVE|CLIENT_PENDING_READ)))
     {
         c->flags |= CLIENT_PENDING_READ;
@@ -2968,16 +3040,22 @@ int handleClientsWithPendingReadsUsingThreads(void) {
     if (tio_debug) printf("I/O READ All threads finshed\n");
 
     /* Run the list of clients again to process the new buffers. */
-    listRewind(server.clients_pending_read,&li);
-    while((ln = listNext(&li))) {
+    while(listLength(server.clients_pending_read)) {
+        ln = listFirst(server.clients_pending_read);
         client *c = listNodeValue(ln);
         c->flags &= ~CLIENT_PENDING_READ;
+        listDelNode(server.clients_pending_read,ln);
+
         if (c->flags & CLIENT_PENDING_COMMAND) {
-            c->flags &= ~ CLIENT_PENDING_COMMAND;
-            processCommandAndResetClient(c);
+            c->flags &= ~CLIENT_PENDING_COMMAND;
+            if (processCommandAndResetClient(c) == C_ERR) {
+                /* If the client is no longer valid, we avoid
+                 * processing the client later. So we just go
+                 * to the next. */
+                continue;
+            }
         }
         processInputBufferAndReplicate(c);
     }
-    listEmpty(server.clients_pending_read);
     return processed;
 }

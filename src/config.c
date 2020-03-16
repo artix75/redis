@@ -108,12 +108,12 @@ clientBufferLimitsConfig clientBufferLimitsDefaults[CLIENT_TYPE_OBUF_COUNT] = {
 /* Generic config infrastructure function pointers
  * int is_valid_fn(val, err)
  *     Return 1 when val is valid, and 0 when invalid.
- *     Optionslly set err to a static error string.
+ *     Optionally set err to a static error string.
  * int update_fn(val, prev, err)
  *     This function is called only for CONFIG SET command (not at config file parsing)
  *     It is called after the actual config is applied,
  *     Return 1 for success, and 0 for failure.
- *     Optionslly set err to a static error string.
+ *     Optionally set err to a static error string.
  *     On failure the config change will be reverted.
  */
 
@@ -518,7 +518,8 @@ void loadServerConfigFromString(char *config) {
     return;
 
 loaderr:
-    fprintf(stderr, "\n*** FATAL CONFIG FILE ERROR ***\n");
+    fprintf(stderr, "\n*** FATAL CONFIG FILE ERROR (Redis %s) ***\n",
+        REDIS_VERSION);
     fprintf(stderr, "Reading the configuration file, at line %d\n", linenum);
     fprintf(stderr, ">>> '%s'\n", lines[i]);
     fprintf(stderr, "%s\n", err);
@@ -729,7 +730,7 @@ void configSetCommand(client *c) {
      * config_set_memory_field(name,var) */
     } config_set_memory_field(
       "client-query-buffer-limit",server.client_max_querybuf_len) {
-    /* Everyhing else is an error... */
+    /* Everything else is an error... */
     } config_set_else {
         addReplyErrorFormat(c,"Unsupported CONFIG parameter: %s",
             (char*)c->argv[2]->ptr);
@@ -1666,16 +1667,15 @@ static int enumConfigSet(typeData data, sds value, int update, char **err) {
         sds enumerr = sdsnew("argument must be one of the following: ");
         configEnum *enumNode = data.enumd.enum_value;
         while(enumNode->name != NULL) {
-            enumerr = sdscatlen(enumerr, enumNode->name, strlen(enumNode->name));
+            enumerr = sdscatlen(enumerr, enumNode->name,
+                                strlen(enumNode->name));
             enumerr = sdscatlen(enumerr, ", ", 2);
             enumNode++;
         }
+        sdsrange(enumerr,0,-3); /* Remove final ", ". */
 
-        enumerr[sdslen(enumerr) - 2] = '\0';
-
-        /* Make sure we don't overrun the fixed buffer */
-        enumerr[LOADBUF_SIZE - 1] = '\0';
         strncpy(loadbuf, enumerr, LOADBUF_SIZE);
+        loadbuf[LOADBUF_SIZE - 1] = '\0';
 
         sdsfree(enumerr);
         *err = loadbuf;
@@ -2084,6 +2084,7 @@ standardConfig configs[] = {
     createBoolConfig("always-show-logo", NULL, IMMUTABLE_CONFIG, server.always_show_logo, 0, NULL, NULL),
     createBoolConfig("protected-mode", NULL, MODIFIABLE_CONFIG, server.protected_mode, 1, NULL, NULL),
     createBoolConfig("rdbcompression", NULL, MODIFIABLE_CONFIG, server.rdb_compression, 1, NULL, NULL),
+    createBoolConfig("rdb-del-sync-files", NULL, MODIFIABLE_CONFIG, server.rdb_del_sync_files, 0, NULL, NULL),
     createBoolConfig("activerehashing", NULL, MODIFIABLE_CONFIG, server.activerehashing, 1, NULL, NULL),
     createBoolConfig("stop-writes-on-bgsave-error", NULL, MODIFIABLE_CONFIG, server.stop_writes_on_bgsave_err, 1, NULL, NULL),
     createBoolConfig("dynamic-hz", NULL, MODIFIABLE_CONFIG, server.dynamic_hz, 1, NULL, NULL), /* Adapt hz to # of clients.*/
@@ -2160,7 +2161,6 @@ standardConfig configs[] = {
     createIntConfig("list-compress-depth", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.list_compress_depth, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("rdb-key-save-delay", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.rdb_key_save_delay, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("key-load-delay", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.key_load_delay, 0, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("tracking-table-max-fill", NULL, MODIFIABLE_CONFIG, 0, 100, server.tracking_table_max_keys, 1000000, INTEGER_CONFIG, NULL, NULL), /* Default: 10% tracking table max number of keys tracked. */
     createIntConfig("active-expire-effort", NULL, MODIFIABLE_CONFIG, 1, 10, server.active_expire_effort, 1, INTEGER_CONFIG, NULL, NULL), /* From 1 to 10. */
     createIntConfig("hz", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.config_hz, CONFIG_DEFAULT_HZ, INTEGER_CONFIG, NULL, updateHZ),
     createIntConfig("min-replicas-to-write", "min-slaves-to-write", MODIFIABLE_CONFIG, 0, INT_MAX, server.repl_min_slaves_to_write, 0, INTEGER_CONFIG, NULL, updateGoodSlaves),
@@ -2195,6 +2195,7 @@ standardConfig configs[] = {
     createSizeTConfig("stream-node-max-bytes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.stream_node_max_bytes, 4096, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("zset-max-ziplist-value", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.zset_max_ziplist_value, 64, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("hll-sparse-max-bytes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.hll_sparse_max_bytes, 3000, MEMORY_CONFIG, NULL, NULL),
+    createSizeTConfig("tracking-table-max-keys", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.tracking_table_max_keys, 1000000, INTEGER_CONFIG, NULL, NULL), /* Default: 1 million keys max. */
 
     /* Other configs */
     createTimeTConfig("repl-backlog-ttl", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.repl_backlog_time_limit, 60*60, INTEGER_CONFIG, NULL, NULL), /* Default: 1 hour */

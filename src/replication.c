@@ -45,6 +45,11 @@ void replicationSendAck(void);
 void putSlaveOnline(client *slave);
 int cancelReplicationHandshake(void);
 
+/* We take a global flag to remember if this instance generated an RDB
+ * because of replication, so that we can remove the RDB file in case
+ * the instance is configured to have no persistence. */
+int RDBGeneratedByReplication = 0;
+
 /* --------------------------- Utility functions ---------------------------- */
 
 /* Return the pointer to a string representing the slave ip:listening_port
@@ -72,6 +77,34 @@ char *replicationGetSlaveName(client *c) {
             (unsigned long long) c->id);
     }
     return buf;
+}
+
+/* Plain unlink() can block for quite some time in order to actually apply
+ * the file deletion to the filesystem. This call removes the file in a
+ * background thread instead. We actually just do close() in the thread,
+ * by using the fact that if there is another instance of the same file open,
+ * the foreground unlink() will not really do anything, and deleting the
+ * file will only happen once the last reference is lost. */
+int bg_unlink(const char *filename) {
+    int fd = open(filename,O_RDONLY|O_NONBLOCK);
+    if (fd == -1) {
+        /* Can't open the file? Fall back to unlinking in the main thread. */
+        return unlink(filename);
+    } else {
+        /* The following unlink() will not do anything since file
+         * is still open. */
+        int retval = unlink(filename);
+        if (retval == -1) {
+            /* If we got an unlink error, we just return it, closing the
+             * new reference we have to the file. */
+            int old_errno = errno;
+            close(fd);  /* This would overwrite our errno. So we saved it. */
+            errno = old_errno;
+            return -1;
+        }
+        bioCreateBackgroundJob(BIO_CLOSE_FILE,(void*)(long)fd,NULL,NULL);
+        return 0; /* Success. */
+    }
 }
 
 /* ---------------------------------- MASTER -------------------------------- */
@@ -591,6 +624,14 @@ int startBgsaveForReplication(int mincapa) {
         retval = C_ERR;
     }
 
+    /* If we succeeded to start a BGSAVE with disk target, let's remember
+     * this fact, so that we can later delete the file if needed. Note
+     * that we don't set the flag to 1 if the feature is disabled, otherwise
+     * it would never be cleared: the file is not deleted. This way if
+     * the user enables it later with CONFIG SET, we are fine. */
+    if (retval == C_OK && !socket_target && server.rdb_del_sync_files)
+        RDBGeneratedByReplication = 1;
+
     /* If we failed to BGSAVE, remove the slaves waiting for a full
      * resynchronization from the list of slaves, inform them with
      * an error about what happened, close the connection ASAP. */
@@ -883,6 +924,53 @@ void putSlaveOnline(client *slave) {
         replicationGetSlaveName(slave));
 }
 
+/* We call this function periodically to remove an RDB file that was
+ * generated because of replication, in an instance that is otherwise
+ * without any persistence. We don't want instances without persistence
+ * to take RDB files around, this violates certain policies in certain
+ * environments. */
+void removeRDBUsedToSyncReplicas(void) {
+    /* If the feature is disabled, return ASAP but also clear the
+     * RDBGeneratedByReplication flag in case it was set. Otherwise if the
+     * feature was enabled, but gets disabled later with CONFIG SET, the
+     * flag may remain set to one: then next time the feature is re-enabled
+     * via CONFIG SET we have have it set even if no RDB was generated
+     * because of replication recently. */
+    if (!server.rdb_del_sync_files) {
+        RDBGeneratedByReplication = 0;
+        return;
+    }
+
+    if (allPersistenceDisabled() && RDBGeneratedByReplication) {
+        client *slave;
+        listNode *ln;
+        listIter li;
+
+        int delrdb = 1;
+        listRewind(server.slaves,&li);
+        while((ln = listNext(&li))) {
+            slave = ln->value;
+            if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START ||
+                slave->replstate == SLAVE_STATE_WAIT_BGSAVE_END ||
+                slave->replstate == SLAVE_STATE_SEND_BULK)
+            {
+                delrdb = 0;
+                break; /* No need to check the other replicas. */
+            }
+        }
+        if (delrdb) {
+            struct stat sb;
+            if (lstat(server.rdb_filename,&sb) != -1) {
+                RDBGeneratedByReplication = 0;
+                serverLog(LL_NOTICE,
+                    "Removing the RDB file used to feed replicas "
+                    "in a persistence-less instance");
+                bg_unlink(server.rdb_filename);
+            }
+        }
+    }
+}
+
 void sendBulkToSlave(connection *conn) {
     client *slave = connGetPrivateData(conn);
     char buf[PROTO_IOBUF_LEN];
@@ -894,7 +982,8 @@ void sendBulkToSlave(connection *conn) {
     if (slave->replpreamble) {
         nwritten = connWrite(conn,slave->replpreamble,sdslen(slave->replpreamble));
         if (nwritten == -1) {
-            serverLog(LL_VERBOSE,"Write error sending RDB preamble to replica: %s",
+            serverLog(LL_VERBOSE,
+                "Write error sending RDB preamble to replica: %s",
                 connGetLastError(conn));
             freeClient(slave);
             return;
@@ -1352,7 +1441,7 @@ void disklessLoadRestoreBackups(redisDb *backup, int restore, int empty_db_flags
 /* Asynchronously read the SYNC payload we receive from a master */
 #define REPL_MAX_WRITTEN_BEFORE_FSYNC (1024*1024*8) /* 8 MB */
 void readSyncBulkPayload(connection *conn) {
-    char buf[4096];
+    char buf[PROTO_IOBUF_LEN];
     ssize_t nread, readlen, nwritten;
     int use_diskless_load = useDisklessLoad();
     redisDb *diskless_load_backup = NULL;
@@ -1639,12 +1728,25 @@ void readSyncBulkPayload(connection *conn) {
                 "Failed trying to load the MASTER synchronization "
                 "DB from disk");
             cancelReplicationHandshake();
+            if (server.rdb_del_sync_files && allPersistenceDisabled()) {
+                serverLog(LL_NOTICE,"Removing the RDB file obtained from "
+                                    "the master. This replica has persistence "
+                                    "disabled");
+                bg_unlink(server.rdb_filename);
+            }
             /* Note that there's no point in restarting the AOF on sync failure,
                it'll be restarted when sync succeeds or replica promoted. */
             return;
         }
 
         /* Cleanup. */
+        if (server.rdb_del_sync_files && allPersistenceDisabled()) {
+            serverLog(LL_NOTICE,"Removing the RDB file obtained from "
+                                "the master. This replica has persistence "
+                                "disabled");
+            bg_unlink(server.rdb_filename);
+        }
+
         zfree(server.repl_transfer_tmpfile);
         close(server.repl_transfer_fd);
         server.repl_transfer_fd = -1;
@@ -2182,6 +2284,10 @@ void syncWithMaster(connection *conn) {
 
     if (psync_result == PSYNC_CONTINUE) {
         serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Master accepted a Partial Resynchronization.");
+        if (server.supervised_mode == SUPERVISED_SYSTEMD) {
+            redisCommunicateSystemd("STATUS=MASTER <-> REPLICA sync: Partial Resynchronization accepted. Ready to accept connections.\n");
+            redisCommunicateSystemd("READY=1\n");
+        }
         return;
     }
 
@@ -3148,6 +3254,10 @@ void replicationCron(void) {
             startBgsaveForReplication(mincapa);
         }
     }
+
+    /* Remove the RDB file used for replication if Redis is not running
+     * with any persistence. */
+    removeRDBUsedToSyncReplicas();
 
     /* Refresh the number of slaves with lag <= min-slaves-max-lag. */
     refreshGoodSlavesCount();

@@ -248,6 +248,10 @@ typedef long long ustime_t; /* microsecond time type. */
                                    perform client side caching. */
 #define CLIENT_TRACKING_BROKEN_REDIR (1ULL<<32) /* Target client is invalid. */
 #define CLIENT_TRACKING_BCAST (1ULL<<33) /* Tracking in BCAST mode. */
+#define CLIENT_TRACKING_OPTIN (1ULL<<34)  /* Tracking in opt-in mode. */
+#define CLIENT_TRACKING_OPTOUT (1ULL<<35) /* Tracking in opt-out mode. */
+#define CLIENT_TRACKING_CACHING (1ULL<<36) /* CACHING yes/no was given,
+                                              depending on optin/optout mode. */
 
 /* Client block type (btype field in client structure)
  * if CLIENT_BLOCKED flag is set. */
@@ -1198,6 +1202,8 @@ struct redisServer {
     char *rdb_filename;             /* Name of RDB file */
     int rdb_compression;            /* Use compression in RDB? */
     int rdb_checksum;               /* Use RDB checksum? */
+    int rdb_del_sync_files;         /* Remove RDB files used only for SYNC if
+                                       the instance does not use persistence. */
     time_t lastsave;                /* Unix time of last successful save */
     time_t lastbgsave_try;          /* Unix time of last attempted bgsave */
     time_t rdb_save_time_last;      /* Time used by last RDB save run. */
@@ -1309,7 +1315,7 @@ struct redisServer {
     list *ready_keys;        /* List of readyList structures for BLPOP & co */
     /* Client side caching. */
     unsigned int tracking_clients;  /* # of clients with tracking enabled.*/
-    int tracking_table_max_keys;    /* Max number of keys in tracking table. */
+    size_t tracking_table_max_keys; /* Max number of keys in tracking table. */
     /* Sort parameters - qsort_r() is only available under BSD so we
      * have to take this state global, in order to pass it to sortCompare() */
     int sort_desc;
@@ -1651,7 +1657,7 @@ void addReplyStatusFormat(client *c, const char *fmt, ...);
 #endif
 
 /* Client side caching (tracking mode) */
-void enableTracking(client *c, uint64_t redirect_to, int bcast, robj **prefix, size_t numprefix);
+void enableTracking(client *c, uint64_t redirect_to, uint64_t options, robj **prefix, size_t numprefix);
 void disableTracking(client *c);
 void trackingRememberKeys(client *c);
 void trackingInvalidateKey(robj *keyobj);
@@ -1782,6 +1788,7 @@ void loadingProgress(off_t pos);
 void stopLoading(int success);
 void startSaving(int rdbflags);
 void stopSaving(int success);
+int allPersistenceDisabled(void);
 
 #define DISK_ERROR_TYPE_AOF 1       /* Don't accept writes: AOF errors. */
 #define DISK_ERROR_TYPE_RDB 2       /* Don't accept writes: RDB errors. */
